@@ -1,0 +1,36 @@
+name: Engineering task
+description: Tech debt, refactoring, infrastructure, CI or documentation work with no user-facing change.
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: What and why
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Definition of done
+      placeholder: |
+        - [ ] ...
+        - [ ] Docs updated
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Frontend
+        - Backend
+        - Database
+        - Infrastructure
+        - CI / tooling
+        - Documentation
+    validations:
+      required: true
+  - type: textarea
+    id: risk
+    attributes:
+      label: Risk and rollback
+      description: What could break? How do we revert?

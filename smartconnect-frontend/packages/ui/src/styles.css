@@ -1,0 +1,39 @@
+/* @smartconnect/ui: make the primitives' classes visible to Tailwind and define their animations.
+   Imported by the app stylesheet after `tailwindcss` and the design tokens. */
+@source "./components";
+
+/* Animations use token durations, so `prefers-reduced-motion` (durations → 0ms) makes them instant. */
+@theme {
+  --animate-sc-fade-in: sc-fade-in var(--sc-duration-fast) var(--sc-ease-enter);
+  --animate-sc-fade-out: sc-fade-out var(--sc-duration-instant) var(--sc-ease-exit);
+  --animate-sc-pop-in: sc-pop-in var(--sc-duration-fast) var(--sc-ease-enter);
+  --animate-sc-slide-in-left: sc-slide-in-left var(--sc-duration-base) var(--sc-ease-enter);
+  --animate-sc-slide-out-left: sc-slide-out-left var(--sc-duration-fast) var(--sc-ease-exit);
+
+  @keyframes sc-fade-in {
+    from {
+      opacity: 0;
+    }
+  }
+  @keyframes sc-fade-out {
+    to {
+      opacity: 0;
+    }
+  }
+  @keyframes sc-pop-in {
+    from {
+      opacity: 0;
+      transform: scale(0.97);
+    }
+  }
+  @keyframes sc-slide-in-left {
+    from {
+      transform: translateX(-100%);
+    }
+  }
+  @keyframes sc-slide-out-left {
+    to {
+      transform: translateX(-100%);
+    }
+  }
+}

@@ -1,0 +1,167 @@
+// =============================================================================
+// Workflows service: sole owner of PostgreSQL schema "workflows".
+//   Design & rationale : docs/database/schema-design.md#workflows
+//   Tenant isolation   : docs/database/tenant-isolation.md
+// Conventions: UUIDv7 primary keys, snake_case tables/columns, timestamptz(3).
+// Cross-service references are plain UUID columns WITHOUT foreign keys, annotated
+// "→ <service>.<table> (logical)"; consistency across services is eventual (outbox events).
+// RLS policies, CHECK constraints, triggers and functions are hand-written SQL appended to the
+// migrations, because Prisma does not model them.
+// =============================================================================
+
+generator client {
+  provider            = "prisma-client"
+  output              = "../src/generated/prisma"
+  moduleFormat        = "esm"
+  importFileExtension = "js"
+  previewFeatures     = ["partialIndexes"]
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// Automation workflows. Definitions are immutable once published (new version per change), so every
+// execution is reproducible against the exact definition it ran.
+
+enum WorkflowStatus {
+  draft
+  active
+  paused
+  archived
+}
+
+enum WorkflowTriggerType {
+  event
+  schedule
+  webhook
+  manual
+}
+
+enum WorkflowExecutionStatus {
+  queued
+  running
+  succeeded
+  failed
+  cancelled
+}
+
+model Workflow {
+  id                  String         @id @default(uuid(7)) @db.Uuid
+  organizationId      String         @map("organization_id") @db.Uuid /// → organization.organizations (logical)
+  workspaceId         String?        @map("workspace_id") @db.Uuid /// → workspace.workspaces (logical)
+  name                String         @db.VarChar(120)
+  description         String?        @db.VarChar(2000)
+  status              WorkflowStatus @default(draft)
+  activeVersionNumber Int?           @map("active_version_number")
+  createdByUserId     String         @map("created_by_user_id") @db.Uuid /// → identity.users (logical)
+  createdAt           DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt           DateTime       @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+  deletedAt           DateTime?      @map("deleted_at") @db.Timestamptz(3)
+
+  versions   WorkflowVersion[]
+  triggers   WorkflowTrigger[]
+  executions WorkflowExecution[]
+
+  @@unique([organizationId, id])
+  @@index([organizationId, status])
+  @@map("workflows")
+}
+
+model WorkflowVersion {
+  id              String    @id @default(uuid(7)) @db.Uuid
+  organizationId  String    @map("organization_id") @db.Uuid
+  workflowId      String    @map("workflow_id") @db.Uuid
+  workflow        Workflow  @relation(fields: [organizationId, workflowId], references: [organizationId, id], onDelete: Cascade)
+  versionNumber   Int       @map("version_number")
+  definition      Json      @db.JsonB /// validated step graph; carries its own schemaVersion
+  createdByUserId String    @map("created_by_user_id") @db.Uuid /// → identity.users (logical)
+  publishedAt     DateTime? @map("published_at") @db.Timestamptz(3)
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  executions WorkflowExecution[]
+
+  @@unique([organizationId, id])
+  @@unique([workflowId, versionNumber])
+  @@map("workflow_versions")
+}
+
+model WorkflowTrigger {
+  id             String              @id @default(uuid(7)) @db.Uuid
+  organizationId String              @map("organization_id") @db.Uuid
+  workflowId     String              @map("workflow_id") @db.Uuid
+  workflow       Workflow            @relation(fields: [organizationId, workflowId], references: [organizationId, id], onDelete: Cascade)
+  type           WorkflowTriggerType
+  eventType      String?             @map("event_type") @db.VarChar(128) /// type = event, e.g. messaging.message.created
+  cronExpression String?             @map("cron_expression") @db.VarChar(120) /// type = schedule
+  timezone       String?             @db.VarChar(64)
+  config         Json                @default("{}") @db.JsonB
+  isEnabled      Boolean             @default(true) @map("is_enabled")
+  nextRunAt      DateTime?           @map("next_run_at") @db.Timestamptz(3)
+  createdAt      DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime            @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@index([organizationId, type, eventType])
+  @@index([nextRunAt], map: "workflow_triggers_due_idx", where: raw("is_enabled AND next_run_at IS NOT NULL"))
+  @@map("workflow_triggers")
+}
+
+model WorkflowExecution {
+  id                String                  @id @default(uuid(7)) @db.Uuid
+  organizationId    String                  @map("organization_id") @db.Uuid
+  workflowId        String                  @map("workflow_id") @db.Uuid
+  workflow          Workflow                @relation(fields: [organizationId, workflowId], references: [organizationId, id], onDelete: Cascade)
+  workflowVersionId String                  @map("workflow_version_id") @db.Uuid
+  workflowVersion   WorkflowVersion         @relation(fields: [organizationId, workflowVersionId], references: [organizationId, id], onDelete: Restrict)
+  triggerId         String?                 @map("trigger_id") @db.Uuid /// no FK: history outlives trigger edits
+  status            WorkflowExecutionStatus @default(queued)
+  triggerPayload    Json?                   @map("trigger_payload") @db.JsonB
+  result            Json?                   @db.JsonB
+  error             String?                 @db.VarChar(4000)
+  attempt           Int                     @default(1)
+  startedAt         DateTime?               @map("started_at") @db.Timestamptz(3)
+  finishedAt        DateTime?               @map("finished_at") @db.Timestamptz(3)
+  createdAt         DateTime                @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime                @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@index([organizationId, workflowId, createdAt(sort: Desc)])
+  @@index([createdAt], map: "workflow_executions_active_idx", where: raw("status = 'queued' OR status = 'running'"))
+  @@map("workflow_executions")
+}
+
+// ---------------------------------------------------------------------------
+// Messaging infrastructure (identical in every service schema)
+// ---------------------------------------------------------------------------
+
+/// Transactional outbox. Domain events are inserted in the SAME transaction as the state change and
+/// published afterwards by this service's relay. The durable source of events (Redis never is).
+/// Not tenant-filtered: the relay processes all organizations.
+model OutboxEvent {
+  id             String    @id @default(uuid(7)) @db.Uuid /// event id, time-ordered
+  aggregateType  String    @map("aggregate_type") @db.VarChar(64)
+  aggregateId    String    @map("aggregate_id") @db.Uuid
+  eventType      String    @map("event_type") @db.VarChar(128) /// e.g. "<service>.<entity>.<past_tense_verb>"
+  eventVersion   Int       @default(1) @map("event_version") @db.SmallInt
+  organizationId String?   @map("organization_id") @db.Uuid /// routing only; null for global events
+  payload        Json      @db.JsonB
+  headers        Json      @default("{}") @db.JsonB /// correlation / trace ids
+  occurredAt     DateTime  @default(now()) @map("occurred_at") @db.Timestamptz(3)
+  publishedAt    DateTime? @map("published_at") @db.Timestamptz(3)
+  attempts       Int       @default(0)
+  lastError      String?   @map("last_error") @db.VarChar(2000)
+
+  @@index([occurredAt], map: "outbox_events_unpublished_idx", where: raw("published_at IS NULL"))
+  @@index([publishedAt], map: "outbox_events_published_idx", where: raw("published_at IS NOT NULL"))
+  @@map("outbox_events")
+}
+
+/// Idempotent-consumer log: one row per (event, handler) successfully processed.
+model ProcessedEvent {
+  eventId     String   @map("event_id") @db.Uuid
+  handler     String   @db.VarChar(128)
+  processedAt DateTime @default(now()) @map("processed_at") @db.Timestamptz(3)
+
+  @@id([eventId, handler])
+  @@index([processedAt])
+  @@map("processed_events")
+}

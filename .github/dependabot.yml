@@ -1,0 +1,60 @@
+# Dependabot version updates. Security alerts and security updates are repository settings
+# (see docs/devops/github-repository-setup.md). PRs target `develop`, which must exist first.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    target-branch: develop
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: 'chore(deps)'
+    groups:
+      prisma:
+        patterns: ['prisma', '@prisma/*']
+      lint-and-format:
+        patterns: ['eslint', '@eslint/*', 'typescript-eslint', 'prettier', 'globals']
+      testing:
+        patterns: ['vitest', '@vitest/*']
+      types:
+        patterns: ['@types/*']
+    ignore:
+      # Majors need an evaluation first (Prisma 8 is a release candidate; Prisma behaviours are pinned
+      # in docs/database/migrations.md). TypeScript 7 is the native port: NestJS 12 pins ~6.0.
+      - dependency-name: 'prisma'
+        update-types: ['version-update:semver-major']
+      - dependency-name: '@prisma/*'
+        update-types: ['version-update:semver-major']
+      - dependency-name: 'typescript'
+        update-types: ['version-update:semver-major']
+      - dependency-name: '@types/node'
+        update-types: ['version-update:semver-major'] # tracks the Node 22 LTS runtime
+
+  - package-ecosystem: github-actions
+    directory: /
+    target-branch: develop
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: 'chore(ci)'
+    groups:
+      actions:
+        patterns: ['*']
+
+  - package-ecosystem: docker-compose
+    directory: /infrastructure/compose
+    target-branch: develop
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: 'chore(infra)'
+    ignore:
+      # A PostgreSQL major upgrade needs pg_upgrade or dump/restore; Redis 8 changed its licence.
+      - dependency-name: 'postgres'
+        update-types: ['version-update:semver-major']
+      - dependency-name: 'redis'
+        update-types: ['version-update:semver-major']

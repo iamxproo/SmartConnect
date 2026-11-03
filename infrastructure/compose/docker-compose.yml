@@ -1,0 +1,181 @@
+# SmartConnect — local development infrastructure (NOT a production deployment).
+#
+# Run from the repository root (or use the Makefile targets, e.g. `make infra-up`):
+#   docker compose -f infrastructure/compose/docker-compose.yml --env-file .env up -d
+#   docker compose -f infrastructure/compose/docker-compose.yml --env-file .env --profile test up -d postgres-test
+#
+# Local vs production differences are documented in docs/database/architecture.md#environments.
+# Volume keys below must not be renamed: they map to the existing named volumes
+# `smartconnect_smartconnect_postgres_data` / `smartconnect_smartconnect_redis_data`.
+
+name: smartconnect
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: '10m'
+    max-file: '3'
+
+x-postgres-base: &postgres-base
+  image: postgres:16-alpine
+  logging: *logging
+  shm_size: 256mb # Docker's 64 MB default breaks parallel query workers
+  stop_grace_period: 60s # allow a clean shutdown checkpoint
+  security_opt:
+    - no-new-privileges:true
+  healthcheck:
+    # TCP probe: during first-time initialisation the server only listens on the unix
+    # socket, so this stays unhealthy until init scripts have finished.
+    test: ['CMD-SHELL', 'pg_isready -h 127.0.0.1 -p 5432 -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+    interval: 10s
+    timeout: 5s
+    retries: 5
+    start_period: 30s
+
+services:
+  postgres:
+    <<: *postgres-base
+    container_name: smartconnect-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB must be set in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set in .env}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_admin_password
+      # Only applied when the data directory is first created.
+      POSTGRES_INITDB_ARGS: '--data-checksums --auth-host=scram-sha-256'
+    secrets:
+      - postgres_admin_password
+    # Sized for an 8 GB Apple Silicon laptop (Docker VM ~4 GB). See docs/database/architecture.md.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - effective_cache_size=768MB
+      - -c
+      - maintenance_work_mem=64MB
+      - -c
+      - work_mem=8MB
+      - -c
+      - max_connections=100
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - password_encryption=scram-sha-256
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.track=top
+      - -c
+      - track_io_timing=on
+      - -c
+      - log_min_duration_statement=500ms
+      # Never write bind parameters (token hashes, emails, message bodies) into slow-query logs.
+      - -c
+      - log_parameter_max_length=0
+      - -c
+      - log_lock_waits=on
+      - -c
+      - log_temp_files=10240
+      - -c
+      - log_line_prefix=%m [%p] %q%u@%d
+      - -c
+      - timezone=UTC
+    ports:
+      - '127.0.0.1:${POSTGRES_PORT:-15432}:5432' # loopback only — never exposed to the LAN
+    volumes:
+      - smartconnect_postgres_data:/var/lib/postgresql/data
+      # Runs ONLY on an empty data directory. Existing clusters are bootstrapped with `make db-bootstrap`.
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1G
+
+  # Disposable PostgreSQL used by automated tests, migration rehearsals, restore drills and as the
+  # Prisma shadow database host. Data lives in tmpfs and disappears when the container stops.
+  postgres-test:
+    <<: *postgres-base
+    container_name: smartconnect-postgres-test
+    profiles: ['test']
+    restart: 'no'
+    environment:
+      POSTGRES_DB: ${POSTGRES_TEST_DB:-smartconnect_test}
+      POSTGRES_USER: ${POSTGRES_TEST_USER:-smartconnect_test_admin}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_test_admin_password
+      POSTGRES_INITDB_ARGS: '--data-checksums --auth-host=scram-sha-256'
+    secrets:
+      - postgres_test_admin_password
+    command:
+      - postgres
+      - -c
+      - shared_buffers=128MB
+      - -c
+      - max_connections=150
+      - -c
+      - password_encryption=scram-sha-256
+      # Durability is irrelevant for a throwaway instance; trade it for speed.
+      - -c
+      - fsync=off
+      - -c
+      - synchronous_commit=off
+      - -c
+      - full_page_writes=off
+      - -c
+      - timezone=UTC
+    tmpfs:
+      - /var/lib/postgresql/data:size=512m
+    ports:
+      - '127.0.0.1:${POSTGRES_TEST_PORT:-15433}:5432'
+    volumes:
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1G
+
+  redis:
+    image: redis:7-alpine
+    container_name: smartconnect-redis
+    restart: unless-stopped
+    logging: *logging
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    entrypoint: ['/bin/sh', '/usr/local/etc/redis/entrypoint.sh']
+    secrets:
+      - redis_password
+    ports:
+      - '127.0.0.1:${REDIS_PORT:-6379}:6379' # loopback only
+    volumes:
+      - smartconnect_redis_data:/data
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - ./redis/entrypoint.sh:/usr/local/etc/redis/entrypoint.sh:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'REDISCLI_AUTH="$$(cat /run/secrets/redis_password)" redis-cli ping | grep -q PONG']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 384M # maxmemory 256mb + AOF-rewrite fork headroom
+
+# Secrets are sourced from the gitignored .env for local development and mounted at
+# /run/secrets/<name>, so they never appear in `docker inspect` output.
+# Production uses a managed secrets store instead (docs/database/security.md).
+secrets:
+  postgres_admin_password:
+    environment: POSTGRES_PASSWORD
+  postgres_test_admin_password:
+    environment: POSTGRES_TEST_PASSWORD
+  redis_password:
+    environment: REDIS_PASSWORD
+
+volumes:
+  smartconnect_postgres_data:
+  smartconnect_redis_data:

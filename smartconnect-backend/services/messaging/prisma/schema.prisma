@@ -1,0 +1,301 @@
+// =============================================================================
+// Messaging service: sole owner of PostgreSQL schema "messaging".
+//   Design & rationale : docs/database/schema-design.md#messaging
+//   Tenant isolation   : docs/database/tenant-isolation.md
+// Conventions: UUIDv7 primary keys, snake_case tables/columns, timestamptz(3).
+// Cross-service references are plain UUID columns WITHOUT foreign keys, annotated
+// "→ <service>.<table> (logical)"; consistency across services is eventual (outbox events).
+// RLS policies, CHECK constraints, triggers and functions are hand-written SQL appended to the
+// migrations, because Prisma does not model them.
+// =============================================================================
+
+generator client {
+  provider            = "prisma-client"
+  output              = "../src/generated/prisma"
+  moduleFormat        = "esm"
+  importFileExtension = "js"
+  previewFeatures     = ["partialIndexes"]
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// Highest-volume schema. Hot paths: timeline page (conversation_id, created_at DESC), thread page,
+// unread state, mentions inbox. Message rows are never updated for reactions/read state (separate tables).
+
+enum ConversationKind {
+  channel /// message stream of a workspace.channels row
+  direct /// exactly two users
+  group /// ad-hoc multi-user conversation
+}
+
+enum ConversationRole {
+  admin /// may add/remove participants, change roles, rename (groups only)
+  member
+}
+
+enum MessageType {
+  standard
+  system /// join/leave/rename notices (sender_user_id is null)
+}
+
+enum MentionKind {
+  user
+  channel /// @channel: every member
+  here /// @here: members online at send time
+}
+
+/// One message stream. Channel conversations mirror workspace.channels (membership projected from
+/// workspace events); direct/group conversations are owned here.
+model Conversation {
+  id              String           @id @default(uuid(7)) @db.Uuid
+  organizationId  String           @map("organization_id") @db.Uuid /// → organization.organizations (logical)
+  kind            ConversationKind
+  workspaceId     String?          @map("workspace_id") @db.Uuid /// → workspace.workspaces (logical)
+  channelId       String?          @unique @map("channel_id") @db.Uuid /// → workspace.channels (logical); iff kind = channel
+  directKey       String?          @map("direct_key") @db.VarChar(80) /// "<smallerUserId>:<largerUserId>"; iff kind = direct
+  title           String?          @db.VarChar(120) /// group conversations only
+  createdByUserId String?          @map("created_by_user_id") @db.Uuid /// → identity.users (logical)
+  lastMessageAt   DateTime?        @map("last_message_at") @db.Timestamptz(3)
+  createdAt       DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime         @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+  archivedAt      DateTime?        @map("archived_at") @db.Timestamptz(3)
+
+  members     ConversationMember[]
+  preferences ConversationPreference[]
+  messages    Message[]
+  readStates  MessageReadState[]
+
+  @@unique([organizationId, id])
+  @@unique([organizationId, directKey]) /// one DM per user pair (NULLs are distinct)
+  @@map("conversations")
+}
+
+model ConversationMember {
+  id             String           @id @default(uuid(7)) @db.Uuid
+  organizationId String           @map("organization_id") @db.Uuid
+  conversationId String           @map("conversation_id") @db.Uuid
+  conversation   Conversation     @relation(fields: [organizationId, conversationId], references: [organizationId, id], onDelete: Cascade)
+  userId         String           @map("user_id") @db.Uuid /// → identity.users (logical)
+  role           ConversationRole @default(member)
+  joinedAt       DateTime         @default(now()) @map("joined_at") @db.Timestamptz(3)
+  createdAt      DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@unique([conversationId, userId])
+  @@index([organizationId, userId]) /// "my conversations"
+  @@map("conversation_members")
+}
+
+/// Messages and thread replies (thread_root_id set). UUIDv7 ids give insert locality on the primary key.
+/// Deletion is soft: body is scrubbed and deleted_at set, so threads keep their shape.
+model Message {
+  id              String       @id @default(uuid(7)) @db.Uuid
+  organizationId  String       @map("organization_id") @db.Uuid
+  conversationId  String       @map("conversation_id") @db.Uuid
+  conversation    Conversation @relation(fields: [organizationId, conversationId], references: [organizationId, id], onDelete: Cascade)
+  threadRootId    String?      @map("thread_root_id") @db.Uuid
+  threadRoot      Message?     @relation("ThreadReplies", fields: [organizationId, threadRootId], references: [organizationId, id], onDelete: Cascade)
+  senderUserId    String?      @map("sender_user_id") @db.Uuid /// → identity.users (logical); null for system messages
+  type            MessageType  @default(standard)
+  body            String /// markdown subset, ≤ 40 000 chars (CHECK)
+  clientMessageId String?      @map("client_message_id") @db.VarChar(64) /// client idempotency key for safe retries
+  editedAt        DateTime?    @map("edited_at") @db.Timestamptz(3)
+  deletedAt       DateTime?    @map("deleted_at") @db.Timestamptz(3)
+  createdAt       DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime     @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  replies       Message[]           @relation("ThreadReplies")
+  thread        MessageThread?
+  reactions     MessageReaction[]
+  attachments   MessageAttachment[]
+  mentions      MessageMention[]
+  bookmarks     MessageBookmark[]
+  activityReads ActivityItemRead[]
+
+  @@unique([organizationId, id])
+  @@unique([conversationId, senderUserId, clientMessageId])
+  @@index([conversationId, createdAt(sort: Desc), id(sort: Desc)], map: "messages_timeline_idx", where: raw("thread_root_id IS NULL"))
+  @@index([threadRootId, createdAt], map: "messages_thread_replies_idx", where: raw("thread_root_id IS NOT NULL"))
+  @@map("messages")
+}
+
+/// Thread summary, keyed by the root message. Keeps reply counters off the hot `messages` rows.
+model MessageThread {
+  rootMessageId      String    @id @map("root_message_id") @db.Uuid
+  organizationId     String    @map("organization_id") @db.Uuid
+  rootMessage        Message   @relation(fields: [organizationId, rootMessageId], references: [organizationId, id], onDelete: Cascade)
+  conversationId     String    @map("conversation_id") @db.Uuid
+  replyCount         Int       @default(0) @map("reply_count")
+  lastReplyAt        DateTime? @map("last_reply_at") @db.Timestamptz(3)
+  participantUserIds String[]  @map("participant_user_ids") @db.Uuid /// → identity.users (logical)
+  createdAt          DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([organizationId, rootMessageId])
+  @@index([conversationId, lastReplyAt(sort: Desc)])
+  @@map("message_threads")
+}
+
+model MessageReaction {
+  organizationId String   @map("organization_id") @db.Uuid
+  messageId      String   @map("message_id") @db.Uuid
+  message        Message  @relation(fields: [organizationId, messageId], references: [organizationId, id], onDelete: Cascade)
+  userId         String   @map("user_id") @db.Uuid /// → identity.users (logical)
+  emoji          String   @db.VarChar(64) /// unicode emoji or :custom_shortcode:
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@id([messageId, userId, emoji])
+  @@map("message_reactions")
+}
+
+model MessageAttachment {
+  id             String   @id @default(uuid(7)) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  messageId      String   @map("message_id") @db.Uuid
+  message        Message  @relation(fields: [organizationId, messageId], references: [organizationId, id], onDelete: Cascade)
+  fileId         String   @map("file_id") @db.Uuid /// → files.files (logical)
+  position       Int      @default(0) @db.SmallInt
+  /// Snapshot of the file's metadata when it was attached (ADR 0013 decision 6): messages render without asking
+  /// the files service. Null only for rows written before the snapshot existed.
+  name           String?  @db.VarChar(255)
+  mimeType       String?  @map("mime_type") @db.VarChar(255)
+  sizeBytes      BigInt?  @map("size_bytes")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@unique([messageId, fileId])
+  @@index([organizationId, fileId]) /// file deleted → find referencing messages
+  @@map("message_attachments")
+}
+
+enum NotificationLevel {
+  all
+  mentions /// thread replies are not activity
+  none /// nothing from this conversation is activity
+}
+
+/// A person's notification level for one conversation (channel conversations included). No row = all.
+model ConversationPreference {
+  organizationId String            @map("organization_id") @db.Uuid
+  conversationId String            @map("conversation_id") @db.Uuid
+  conversation   Conversation      @relation(fields: [organizationId, conversationId], references: [organizationId, id], onDelete: Cascade)
+  userId         String            @map("user_id") @db.Uuid /// → identity.users (logical)
+  level          NotificationLevel
+  updatedAt      DateTime          @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@id([conversationId, userId])
+  @@index([organizationId, userId])
+  @@map("conversation_preferences")
+}
+
+enum ActivityKind {
+  mention
+  thread_reply
+}
+
+/// Activity read model, part 1: every item created up to `seen_until` counts as read ("mark all as read").
+model ActivityReadState {
+  organizationId String   @map("organization_id") @db.Uuid
+  userId         String   @map("user_id") @db.Uuid /// → identity.users (logical)
+  seenUntil      DateTime @map("seen_until") @db.Timestamptz(3)
+  updatedAt      DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@id([organizationId, userId])
+  @@map("activity_read_states")
+}
+
+/// Activity read model, part 2: items read one by one after `seen_until`.
+model ActivityItemRead {
+  organizationId String       @map("organization_id") @db.Uuid
+  userId         String       @map("user_id") @db.Uuid /// → identity.users (logical)
+  messageId      String       @map("message_id") @db.Uuid
+  message        Message      @relation(fields: [organizationId, messageId], references: [organizationId, id], onDelete: Cascade)
+  kind           ActivityKind
+  readAt         DateTime     @default(now()) @map("read_at") @db.Timestamptz(3)
+
+  @@id([userId, messageId, kind])
+  @@index([organizationId, userId])
+  @@map("activity_item_reads")
+}
+
+model MessageMention {
+  id              String      @id @default(uuid(7)) @db.Uuid
+  organizationId  String      @map("organization_id") @db.Uuid
+  messageId       String      @map("message_id") @db.Uuid
+  message         Message     @relation(fields: [organizationId, messageId], references: [organizationId, id], onDelete: Cascade)
+  conversationId  String      @map("conversation_id") @db.Uuid
+  kind            MentionKind
+  mentionedUserId String?     @map("mentioned_user_id") @db.Uuid /// → identity.users (logical); null for @channel/@here
+  createdAt       DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@unique([messageId, kind, mentionedUserId])
+  @@index([organizationId, mentionedUserId, createdAt(sort: Desc)], map: "message_mentions_inbox_idx", where: raw("mentioned_user_id IS NOT NULL"))
+  @@map("message_mentions")
+}
+
+model MessageBookmark {
+  organizationId String   @map("organization_id") @db.Uuid
+  userId         String   @map("user_id") @db.Uuid /// → identity.users (logical)
+  messageId      String   @map("message_id") @db.Uuid
+  message        Message  @relation(fields: [organizationId, messageId], references: [organizationId, id], onDelete: Cascade)
+  note           String?  @db.VarChar(500)
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@id([userId, messageId])
+  @@index([organizationId, userId, createdAt(sort: Desc)])
+  @@map("message_bookmarks")
+}
+
+/// One row per (conversation, user): a read cursor, NOT per-message receipts (which would grow as
+/// messages × members). Separate from conversation_members because it is written on every read.
+model MessageReadState {
+  organizationId     String       @map("organization_id") @db.Uuid
+  conversationId     String       @map("conversation_id") @db.Uuid
+  conversation       Conversation @relation(fields: [organizationId, conversationId], references: [organizationId, id], onDelete: Cascade)
+  userId             String       @map("user_id") @db.Uuid /// → identity.users (logical)
+  lastReadMessageId  String?      @map("last_read_message_id") @db.Uuid /// no FK: cursor survives message purge
+  lastReadAt         DateTime     @default(now()) @map("last_read_at") @db.Timestamptz(3)
+  unreadMentionCount Int          @default(0) @map("unread_mention_count")
+  updatedAt          DateTime     @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@id([conversationId, userId])
+  @@index([organizationId, userId])
+  @@map("message_read_states")
+}
+
+// ---------------------------------------------------------------------------
+// Messaging infrastructure (identical in every service schema)
+// ---------------------------------------------------------------------------
+
+/// Transactional outbox. Domain events are inserted in the SAME transaction as the state change and
+/// published afterwards by this service's relay. The durable source of events (Redis never is).
+/// Not tenant-filtered: the relay processes all organizations.
+model OutboxEvent {
+  id             String    @id @default(uuid(7)) @db.Uuid /// event id, time-ordered
+  aggregateType  String    @map("aggregate_type") @db.VarChar(64)
+  aggregateId    String    @map("aggregate_id") @db.Uuid
+  eventType      String    @map("event_type") @db.VarChar(128) /// e.g. "<service>.<entity>.<past_tense_verb>"
+  eventVersion   Int       @default(1) @map("event_version") @db.SmallInt
+  organizationId String?   @map("organization_id") @db.Uuid /// routing only; null for global events
+  payload        Json      @db.JsonB
+  headers        Json      @default("{}") @db.JsonB /// correlation / trace ids
+  occurredAt     DateTime  @default(now()) @map("occurred_at") @db.Timestamptz(3)
+  publishedAt    DateTime? @map("published_at") @db.Timestamptz(3)
+  attempts       Int       @default(0)
+  lastError      String?   @map("last_error") @db.VarChar(2000)
+
+  @@index([occurredAt], map: "outbox_events_unpublished_idx", where: raw("published_at IS NULL"))
+  @@index([publishedAt], map: "outbox_events_published_idx", where: raw("published_at IS NOT NULL"))
+  @@map("outbox_events")
+}
+
+/// Idempotent-consumer log: one row per (event, handler) successfully processed.
+model ProcessedEvent {
+  eventId     String   @map("event_id") @db.Uuid
+  handler     String   @db.VarChar(128)
+  processedAt DateTime @default(now()) @map("processed_at") @db.Timestamptz(3)
+
+  @@id([eventId, handler])
+  @@index([processedAt])
+  @@map("processed_events")
+}

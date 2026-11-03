@@ -1,0 +1,229 @@
+// =============================================================================
+// Identity service: sole owner of PostgreSQL schema "identity".
+//   Design & rationale : docs/database/schema-design.md#identity
+//   Tenant isolation   : docs/database/tenant-isolation.md
+// Conventions: UUIDv7 primary keys, snake_case tables/columns, timestamptz(3).
+// Cross-service references are plain UUID columns WITHOUT foreign keys, annotated
+// "→ <service>.<table> (logical)"; consistency across services is eventual (outbox events).
+// RLS policies, CHECK constraints, triggers and functions are hand-written SQL appended to the
+// migrations, because Prisma does not model them.
+// =============================================================================
+
+generator client {
+  provider            = "prisma-client"
+  output              = "../src/generated/prisma"
+  moduleFormat        = "esm"
+  importFileExtension = "js"
+  previewFeatures     = ["partialIndexes"]
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// Identity data is GLOBAL (not tenant-scoped): a user account can belong to many organizations.
+// No organization_id, no RLS; per-user isolation is enforced in the service layer.
+
+enum AccountStatus {
+  active
+  suspended
+  deactivated
+}
+
+enum CredentialType {
+  password
+  totp
+}
+
+/// Platform-wide roles (ADR 0015), separate from per-organization roles in the organization service.
+enum PlatformRole {
+  super_admin
+}
+
+enum DevicePlatform {
+  web
+  ios
+  android
+  desktop
+}
+
+enum PushProvider {
+  fcm
+  apns
+  webpush
+}
+
+enum VerificationPurpose {
+  email_verification
+  password_reset
+  email_change
+}
+
+/// A person's login identity. Soft-deleted on account deletion: PII is erased after a 30-day grace period
+/// (email_normalized is replaced with a tombstone so the address can be reused).
+model User {
+  id              String        @id @default(uuid(7)) @db.Uuid
+  email           String        @db.VarChar(320) /// as entered, for display
+  emailNormalized String        @unique @map("email_normalized") @db.VarChar(320) /// lower(trim(email)); login lookup key
+  emailVerifiedAt DateTime?     @map("email_verified_at") @db.Timestamptz(3)
+  status          AccountStatus @default(active)
+  lastLoginAt     DateTime?     @map("last_login_at") @db.Timestamptz(3)
+  createdAt       DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime      @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+  deletedAt       DateTime?     @map("deleted_at") @db.Timestamptz(3)
+
+  credentials        Credential[]
+  platformRoles      PlatformRoleAssignment[]
+  profile            UserProfile?
+  devices            Device[]
+  sessions           Session[]
+  verificationTokens VerificationToken[]
+
+  @@map("users")
+}
+
+/// Secret material, kept out of `users` so ordinary user reads never load it.
+model Credential {
+  id             String         @id @default(uuid(7)) @db.Uuid
+  userId         String         @map("user_id") @db.Uuid
+  user           User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type           CredentialType
+  secret         String /// password: argon2id hash. totp: envelope-encrypted seed. Never plaintext.
+  /// password only: issued by someone else (the development Super Admin seed, ADR 0015); the holder must replace it
+  /// before using administration features. Cleared by every password change or reset.
+  changeRequired Boolean        @default(false) @map("change_required")
+  lastUsedAt     DateTime?      @map("last_used_at") @db.Timestamptz(3)
+  createdAt      DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime       @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([userId, type])
+  @@map("credentials")
+}
+
+/// Global profile + UI preferences (replaces the candidate `user_preferences` table: schemaless,
+/// always read together with the profile, validated by the service).
+/// Who holds a platform-wide role (ADR 0015). Checked by the service on every administration request; access
+/// tokens never carry roles, so revoking a row takes effect at once.
+model PlatformRoleAssignment {
+  userId    String       @map("user_id") @db.Uuid
+  user      User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role      PlatformRole
+  createdAt DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@id([userId, role])
+  @@map("platform_role_assignments")
+}
+
+model UserProfile {
+  userId          String   @id @map("user_id") @db.Uuid
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  displayName     String   @map("display_name") @db.VarChar(80)
+  fullName        String?  @map("full_name") @db.VarChar(200)
+  avatarObjectKey String?  @map("avatar_object_key") @db.VarChar(512) /// key in the public avatar bucket
+  timezone        String   @default("UTC") @db.VarChar(64)
+  locale          String   @default("en") @db.VarChar(16)
+  preferences     Json     @default("{}") @db.JsonB
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@map("user_profiles")
+}
+
+/// A registered client installation (browser, phone, desktop). Holds the push token used by notifications.
+model Device {
+  id           String         @id @default(uuid(7)) @db.Uuid
+  userId       String         @map("user_id") @db.Uuid
+  user         User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  platform     DevicePlatform
+  name         String?        @db.VarChar(120)
+  appVersion   String?        @map("app_version") @db.VarChar(32)
+  pushProvider PushProvider?  @map("push_provider")
+  pushToken    String?        @unique @map("push_token") @db.VarChar(1024)
+  lastSeenAt   DateTime       @default(now()) @map("last_seen_at") @db.Timestamptz(3)
+  createdAt    DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime       @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+  revokedAt    DateTime?      @map("revoked_at") @db.Timestamptz(3)
+
+  sessions Session[]
+
+  @@index([userId])
+  @@map("devices")
+}
+
+/// A login session. Only SHA-256 hashes of opaque refresh tokens are stored. Refresh tokens rotate on
+/// every use; presenting `previous_refresh_token_hash` again signals token theft → revoke the session.
+model Session {
+  id                       String    @id @default(uuid(7)) @db.Uuid
+  userId                   String    @map("user_id") @db.Uuid
+  user                     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deviceId                 String?   @map("device_id") @db.Uuid
+  device                   Device?   @relation(fields: [deviceId], references: [id], onDelete: SetNull)
+  refreshTokenHash         String    @unique @map("refresh_token_hash") @db.Char(64)
+  previousRefreshTokenHash String?   @unique @map("previous_refresh_token_hash") @db.Char(64)
+  ipAddress                String?   @map("ip_address") @db.Inet
+  userAgent                String?   @map("user_agent") @db.VarChar(512)
+  lastUsedAt               DateTime  @default(now()) @map("last_used_at") @db.Timestamptz(3)
+  expiresAt                DateTime  @map("expires_at") @db.Timestamptz(3)
+  revokedAt                DateTime? @map("revoked_at") @db.Timestamptz(3)
+  revokedReason            String?   @map("revoked_reason") @db.VarChar(64)
+  createdAt                DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt                DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@index([userId], map: "sessions_active_by_user_idx", where: raw("revoked_at IS NULL"))
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+/// Single-use, short-lived tokens (email verification, password reset, email change). Hash only.
+model VerificationToken {
+  id          String              @id @default(uuid(7)) @db.Uuid
+  userId      String              @map("user_id") @db.Uuid
+  user        User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  purpose     VerificationPurpose
+  tokenHash   String              @unique @map("token_hash") @db.Char(64)
+  targetEmail String?             @map("target_email") @db.VarChar(320) /// email_change only
+  expiresAt   DateTime            @map("expires_at") @db.Timestamptz(3)
+  consumedAt  DateTime?           @map("consumed_at") @db.Timestamptz(3)
+  createdAt   DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([userId, purpose])
+  @@index([expiresAt])
+  @@map("verification_tokens")
+}
+
+// ---------------------------------------------------------------------------
+// Messaging infrastructure (identical in every service schema)
+// ---------------------------------------------------------------------------
+
+/// Transactional outbox. Domain events are inserted in the SAME transaction as the state change and
+/// published afterwards by this service's relay. The durable source of events (Redis never is).
+/// Not tenant-filtered: the relay processes all organizations.
+model OutboxEvent {
+  id             String    @id @default(uuid(7)) @db.Uuid /// event id, time-ordered
+  aggregateType  String    @map("aggregate_type") @db.VarChar(64)
+  aggregateId    String    @map("aggregate_id") @db.Uuid
+  eventType      String    @map("event_type") @db.VarChar(128) /// e.g. "<service>.<entity>.<past_tense_verb>"
+  eventVersion   Int       @default(1) @map("event_version") @db.SmallInt
+  organizationId String?   @map("organization_id") @db.Uuid /// routing only; null for global events
+  payload        Json      @db.JsonB
+  headers        Json      @default("{}") @db.JsonB /// correlation / trace ids
+  occurredAt     DateTime  @default(now()) @map("occurred_at") @db.Timestamptz(3)
+  publishedAt    DateTime? @map("published_at") @db.Timestamptz(3)
+  attempts       Int       @default(0)
+  lastError      String?   @map("last_error") @db.VarChar(2000)
+
+  @@index([occurredAt], map: "outbox_events_unpublished_idx", where: raw("published_at IS NULL"))
+  @@index([publishedAt], map: "outbox_events_published_idx", where: raw("published_at IS NOT NULL"))
+  @@map("outbox_events")
+}
+
+/// Idempotent-consumer log: one row per (event, handler) successfully processed.
+model ProcessedEvent {
+  eventId     String   @map("event_id") @db.Uuid
+  handler     String   @db.VarChar(128)
+  processedAt DateTime @default(now()) @map("processed_at") @db.Timestamptz(3)
+
+  @@id([eventId, handler])
+  @@index([processedAt])
+  @@map("processed_events")
+}

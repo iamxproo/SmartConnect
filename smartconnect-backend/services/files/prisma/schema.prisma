@@ -1,0 +1,120 @@
+// =============================================================================
+// Files service: sole owner of PostgreSQL schema "files".
+//   Design & rationale : docs/database/schema-design.md#files
+//   Tenant isolation   : docs/database/tenant-isolation.md
+// Conventions: UUIDv7 primary keys, snake_case tables/columns, timestamptz(3).
+// Cross-service references are plain UUID columns WITHOUT foreign keys, annotated
+// "→ <service>.<table> (logical)"; consistency across services is eventual (outbox events).
+// RLS policies, CHECK constraints, triggers and functions are hand-written SQL appended to the
+// migrations, because Prisma does not model them.
+// =============================================================================
+
+generator client {
+  provider            = "prisma-client"
+  output              = "../src/generated/prisma"
+  moduleFormat        = "esm"
+  importFileExtension = "js"
+  previewFeatures     = ["partialIndexes"]
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// File metadata; bytes live in object storage. Access is derived from the owning context
+// (a message, document, task…): the owning service authorizes, then asks this service for a short-lived
+// signed URL. The candidate `file_permissions` table is deferred until explicit per-file sharing exists.
+
+enum FileStatus {
+  pending_upload
+  scanning /// malware scan in progress; not downloadable
+  available
+  quarantined
+  deleted
+}
+
+enum FileContextType {
+  message
+  document
+  task
+  meeting_recording
+  workspace
+  upload /// uploaded but not attached to anything yet; context_id is the file's own id
+}
+
+model File {
+  id               String          @id @default(uuid(7)) @db.Uuid
+  organizationId   String          @map("organization_id") @db.Uuid /// → organization.organizations (logical)
+  uploadedByUserId String          @map("uploaded_by_user_id") @db.Uuid /// → identity.users (logical)
+  contextType      FileContextType @map("context_type")
+  contextId        String          @map("context_id") @db.Uuid /// owning resource in another service (logical)
+  name             String          @db.VarChar(255)
+  mimeType         String          @map("mime_type") @db.VarChar(255)
+  sizeBytes        BigInt          @map("size_bytes") /// current version
+  status           FileStatus      @default(pending_upload)
+  currentVersion   Int             @default(1) @map("current_version")
+  createdAt        DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime        @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+  deletedAt        DateTime?       @map("deleted_at") @db.Timestamptz(3)
+
+  versions FileVersion[]
+
+  @@unique([organizationId, id])
+  @@index([organizationId, contextType, contextId])
+  @@index([organizationId, uploadedByUserId, createdAt(sort: Desc)])
+  @@map("files")
+}
+
+model FileVersion {
+  id               String   @id @default(uuid(7)) @db.Uuid
+  organizationId   String   @map("organization_id") @db.Uuid
+  fileId           String   @map("file_id") @db.Uuid
+  file             File     @relation(fields: [organizationId, fileId], references: [organizationId, id], onDelete: Cascade)
+  versionNumber    Int      @map("version_number")
+  storageKey       String   @unique @map("storage_key") @db.VarChar(1024) /// "<org>/<file>/<version>"; never user-supplied
+  mimeType         String   @map("mime_type") @db.VarChar(255)
+  sizeBytes        BigInt   @map("size_bytes")
+  checksumSha256   String   @map("checksum_sha256") @db.Char(64)
+  uploadedByUserId String   @map("uploaded_by_user_id") @db.Uuid /// → identity.users (logical)
+  createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@unique([fileId, versionNumber])
+  @@map("file_versions")
+}
+
+// ---------------------------------------------------------------------------
+// Messaging infrastructure (identical in every service schema)
+// ---------------------------------------------------------------------------
+
+/// Transactional outbox. Domain events are inserted in the SAME transaction as the state change and
+/// published afterwards by this service's relay. The durable source of events (Redis never is).
+/// Not tenant-filtered: the relay processes all organizations.
+model OutboxEvent {
+  id             String    @id @default(uuid(7)) @db.Uuid /// event id, time-ordered
+  aggregateType  String    @map("aggregate_type") @db.VarChar(64)
+  aggregateId    String    @map("aggregate_id") @db.Uuid
+  eventType      String    @map("event_type") @db.VarChar(128) /// e.g. "<service>.<entity>.<past_tense_verb>"
+  eventVersion   Int       @default(1) @map("event_version") @db.SmallInt
+  organizationId String?   @map("organization_id") @db.Uuid /// routing only; null for global events
+  payload        Json      @db.JsonB
+  headers        Json      @default("{}") @db.JsonB /// correlation / trace ids
+  occurredAt     DateTime  @default(now()) @map("occurred_at") @db.Timestamptz(3)
+  publishedAt    DateTime? @map("published_at") @db.Timestamptz(3)
+  attempts       Int       @default(0)
+  lastError      String?   @map("last_error") @db.VarChar(2000)
+
+  @@index([occurredAt], map: "outbox_events_unpublished_idx", where: raw("published_at IS NULL"))
+  @@index([publishedAt], map: "outbox_events_published_idx", where: raw("published_at IS NOT NULL"))
+  @@map("outbox_events")
+}
+
+/// Idempotent-consumer log: one row per (event, handler) successfully processed.
+model ProcessedEvent {
+  eventId     String   @map("event_id") @db.Uuid
+  handler     String   @db.VarChar(128)
+  processedAt DateTime @default(now()) @map("processed_at") @db.Timestamptz(3)
+
+  @@id([eventId, handler])
+  @@index([processedAt])
+  @@map("processed_events")
+}

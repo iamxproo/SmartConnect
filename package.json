@@ -1,0 +1,53 @@
+{
+  "name": "smartconnect",
+  "version": "0.0.0",
+  "private": true,
+  "description": "SmartConnect monorepo: React/React Native frontend, NestJS microservices backend, shared packages, infrastructure and tests.",
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "smartconnect-backend/services/*",
+    "smartconnect-backend/packages/*",
+    "smartconnect-backend/scripts",
+    "smartconnect-backend/api-gateway",
+    "smartconnect-backend/realtime-gateway",
+    "smartconnect-frontend/web",
+    "smartconnect-frontend/mobile",
+    "smartconnect-frontend/packages/*",
+    "tests"
+  ],
+  "engines": {
+    "node": ">=22.13",
+    "npm": ">=10"
+  },
+  "packageManager": "npm@10.9.2",
+  "scripts": {
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "prelint": "npm run build --workspace @smartconnect/backend-kit",
+    "lint": "eslint --max-warnings=0 .",
+    "lint:fix": "eslint --fix .",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test:unit --workspace tests",
+    "test:unit": "npm run test:unit --workspace tests",
+    "test:db": "npm run test:db --workspace tests",
+    "prisma:validate": "npm run prisma:validate --workspaces --if-present",
+    "prisma:generate": "npm run prisma:generate --workspaces --if-present"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "eslint": "10.13.0",
+    "eslint-plugin-react-hooks": "7.1.1",
+    "globals": "17.14.0",
+    "prettier": "3.9.10",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.72.1"
+  },
+  "overrides": {
+    "jsdom": "29.1.1",
+    "@nestjs/platform-express": {
+      "multer": "2.5.0"
+    }
+  }
+}

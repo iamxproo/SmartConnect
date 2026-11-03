@@ -1,0 +1,77 @@
+# Database foundation checks: migrations from zero, schema/migration drift, least privilege, tenant
+# isolation (RLS), backup/restore, using the same Compose file, bootstrap SQL, tooling and test suites
+# as local development. Credentials are generated per run and never leave the runner.
+name: database
+
+on:
+  # No `paths:` filter on purpose: this job is a required status check, and a required check whose
+  # workflow is path-filtered out never reports, which blocks the pull request indefinitely.
+  pull_request:
+  push:
+    branches: [main, develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: database-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PRISMA_HIDE_UPDATE_MESSAGE: '1'
+
+jobs:
+  database:
+    name: Migrations, privileges, tenant isolation, backup/restore
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Generate ephemeral credentials (.env)
+        run: |
+          pw() { openssl rand -base64 64 | tr -dc 'A-Za-z0-9' | head -c 40; }
+          umask 077
+          cat > .env <<EOF
+          POSTGRES_DB=smartconnect
+          POSTGRES_USER=smartconnect_admin
+          POSTGRES_PASSWORD=$(pw)
+          POSTGRES_PORT=15432
+          POSTGRES_TEST_DB=smartconnect_test
+          POSTGRES_TEST_USER=smartconnect_test_admin
+          POSTGRES_TEST_PASSWORD=$(pw)
+          POSTGRES_TEST_PORT=15433
+          REDIS_PORT=6379
+          REDIS_PASSWORD=$(pw)
+          EOF
+
+      - name: Start PostgreSQL (dev + test) and Redis
+        run: |
+          docker compose -f infrastructure/compose/docker-compose.yml --env-file .env up -d --wait postgres redis
+          docker compose -f infrastructure/compose/docker-compose.yml --env-file .env --profile test up -d --wait postgres-test
+
+      - name: Install and generate Prisma clients
+        run: |
+          npm ci
+          npm run prisma:generate
+
+      - name: Bootstrap roles/schemas, apply migrations, status, drift
+        run: |
+          node infrastructure/scripts/db.mjs bootstrap
+          node infrastructure/scripts/db.mjs migrate
+          node infrastructure/scripts/db.mjs status
+          node infrastructure/scripts/db.mjs check-drift
+
+      # Also the identity/auth integration suites (real identity service + gateway on the test database) and the
+      # gateway's Redis rate-limit store against the Redis started above.
+      - name: Database and identity integration suites (migrations, privileges, RLS, backup/restore, auth)
+        run: npm run test:db
+
+      - name: Container logs on failure
+        if: failure()
+        run: docker compose -f infrastructure/compose/docker-compose.yml --env-file .env --profile test logs --no-color --tail 200

@@ -1,0 +1,20 @@
+{
+  "name": "@smartconnect/backend-scripts",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Backend-level developer scripts (dev seed, development Super Admin). Each service owns its own package.json; this package exists so that no workspace member contains another (npm 10 skips installing peer-heavy dependencies such as Prisma in that layout).",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "db:seed": "tsx seed-dev.ts",
+    "db:seed-super-admin": "tsx seed-super-admin.ts",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "typescript": "6.0.3",
+    "tsx": "4.23.15"
+  }
+}

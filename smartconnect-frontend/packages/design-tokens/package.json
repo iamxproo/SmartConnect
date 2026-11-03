@@ -1,0 +1,22 @@
+{
+  "name": "@smartconnect/design-tokens",
+  "version": "0.0.0",
+  "private": true,
+  "description": "SmartConnect design tokens: platform-neutral TypeScript source, generated CSS variables and Tailwind v4 theme.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./tokens.css": "./tokens.css",
+    "./tailwind-theme.css": "./tailwind-theme.css"
+  },
+  "scripts": {
+    "generate": "tsx scripts/generate.ts",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "tsx": "4.23.15",
+    "typescript": "6.0.3",
+    "vitest": "5.0.5"
+  }
+}

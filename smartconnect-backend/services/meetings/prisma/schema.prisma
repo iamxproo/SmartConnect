@@ -1,0 +1,209 @@
+// =============================================================================
+// Meetings service: sole owner of PostgreSQL schema "meetings".
+//   Design & rationale : docs/database/schema-design.md#meetings
+//   Tenant isolation   : docs/database/tenant-isolation.md
+// Conventions: UUIDv7 primary keys, snake_case tables/columns, timestamptz(3).
+// Cross-service references are plain UUID columns WITHOUT foreign keys, annotated
+// "→ <service>.<table> (logical)"; consistency across services is eventual (outbox events).
+// RLS policies, CHECK constraints, triggers and functions are hand-written SQL appended to the
+// migrations, because Prisma does not model them.
+// =============================================================================
+
+generator client {
+  provider            = "prisma-client"
+  output              = "../src/generated/prisma"
+  moduleFormat        = "esm"
+  importFileExtension = "js"
+  previewFeatures     = ["partialIndexes"]
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// Meeting metadata only. Media (audio/video) flows through the SFU; nothing per-packet is stored.
+// Capacity target: 10–30 concurrent rooms → low write volume (joins/leaves/events).
+
+enum MeetingKind {
+  instant
+  scheduled
+}
+
+enum MeetingStatus {
+  scheduled
+  live
+  ended
+  cancelled
+}
+
+enum MeetingJoinPolicy {
+  organization /// any member of the organization
+  invited /// invitees only
+  link /// anyone with the link, including external guests
+}
+
+enum ParticipantRole {
+  host
+  cohost
+  participant
+}
+
+enum InvitationResponse {
+  pending
+  accepted
+  declined
+  tentative
+}
+
+enum RecordingStatus {
+  recording
+  processing
+  ready
+  failed
+  deleted
+}
+
+model Meeting {
+  id               String            @id @default(uuid(7)) @db.Uuid
+  organizationId   String            @map("organization_id") @db.Uuid /// → organization.organizations (logical)
+  workspaceId      String?           @map("workspace_id") @db.Uuid /// → workspace.workspaces (logical)
+  channelId        String?           @map("channel_id") @db.Uuid /// → workspace.channels (logical)
+  conversationId   String?           @map("conversation_id") @db.Uuid /// → messaging.conversations (logical)
+  title            String            @db.VarChar(200)
+  description      String?           @db.VarChar(5000)
+  kind             MeetingKind
+  status           MeetingStatus     @default(scheduled)
+  joinPolicy       MeetingJoinPolicy @default(organization) @map("join_policy")
+  hostUserId       String            @map("host_user_id") @db.Uuid /// → identity.users (logical)
+  scheduledStartAt DateTime?         @map("scheduled_start_at") @db.Timestamptz(3)
+  scheduledEndAt   DateTime?         @map("scheduled_end_at") @db.Timestamptz(3)
+  startedAt        DateTime?         @map("started_at") @db.Timestamptz(3)
+  endedAt          DateTime?         @map("ended_at") @db.Timestamptz(3)
+  mediaRoomId      String?           @unique @map("media_room_id") @db.VarChar(128) /// SFU room identifier
+  recordingEnabled Boolean           @default(false) @map("recording_enabled")
+  maxParticipants  Int?              @map("max_participants")
+  createdAt        DateTime          @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime          @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  invitations  MeetingInvitation[]
+  participants MeetingParticipant[]
+  recordings   MeetingRecording[]
+  events       MeetingEvent[]
+
+  @@unique([organizationId, id])
+  @@index([organizationId, status, scheduledStartAt])
+  @@index([organizationId, channelId], where: raw("channel_id IS NOT NULL"))
+  @@map("meetings")
+}
+
+model MeetingInvitation {
+  id              String             @id @default(uuid(7)) @db.Uuid
+  organizationId  String             @map("organization_id") @db.Uuid
+  meetingId       String             @map("meeting_id") @db.Uuid
+  meeting         Meeting            @relation(fields: [organizationId, meetingId], references: [organizationId, id], onDelete: Cascade)
+  inviteeUserId   String?            @map("invitee_user_id") @db.Uuid /// → identity.users (logical)
+  inviteeEmail    String?            @map("invitee_email") @db.VarChar(320) /// external guest (normalized)
+  invitedByUserId String             @map("invited_by_user_id") @db.Uuid /// → identity.users (logical)
+  response        InvitationResponse @default(pending)
+  respondedAt     DateTime?          @map("responded_at") @db.Timestamptz(3)
+  createdAt       DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime           @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([meetingId, inviteeUserId])
+  @@unique([meetingId, inviteeEmail])
+  @@index([organizationId, inviteeUserId])
+  @@map("meeting_invitations")
+}
+
+/// One row per join session (a rejoin creates a new row) → accurate attendance and durations.
+model MeetingParticipant {
+  id             String          @id @default(uuid(7)) @db.Uuid
+  organizationId String          @map("organization_id") @db.Uuid
+  meetingId      String          @map("meeting_id") @db.Uuid
+  meeting        Meeting         @relation(fields: [organizationId, meetingId], references: [organizationId, id], onDelete: Cascade)
+  userId         String?         @map("user_id") @db.Uuid /// → identity.users (logical); null for guests
+  guestName      String?         @map("guest_name") @db.VarChar(80)
+  role           ParticipantRole @default(participant)
+  mediaSessionId String?         @map("media_session_id") @db.VarChar(128)
+  joinedAt       DateTime        @default(now()) @map("joined_at") @db.Timestamptz(3)
+  leftAt         DateTime?       @map("left_at") @db.Timestamptz(3)
+  createdAt      DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([meetingId, joinedAt])
+  @@index([organizationId, userId, joinedAt(sort: Desc)])
+  @@map("meeting_participants")
+}
+
+model MeetingRecording {
+  id              String          @id @default(uuid(7)) @db.Uuid
+  organizationId  String          @map("organization_id") @db.Uuid
+  meetingId       String          @map("meeting_id") @db.Uuid
+  meeting         Meeting         @relation(fields: [organizationId, meetingId], references: [organizationId, id], onDelete: Cascade)
+  fileId          String?         @map("file_id") @db.Uuid /// → files.files (logical); set once processed
+  status          RecordingStatus @default(recording)
+  startedByUserId String          @map("started_by_user_id") @db.Uuid /// → identity.users (logical)
+  startedAt       DateTime        @default(now()) @map("started_at") @db.Timestamptz(3)
+  endedAt         DateTime?       @map("ended_at") @db.Timestamptz(3)
+  durationSeconds Int?            @map("duration_seconds")
+  sizeBytes       BigInt?         @map("size_bytes")
+  createdAt       DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime        @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+  deletedAt       DateTime?       @map("deleted_at") @db.Timestamptz(3)
+
+  @@index([meetingId])
+  @@index([organizationId, createdAt(sort: Desc)])
+  @@map("meeting_recordings")
+}
+
+/// Append-only meeting timeline (joins, leaves, recording/screen-share start/stop, host changes).
+model MeetingEvent {
+  id             String   @id @default(uuid(7)) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  meetingId      String   @map("meeting_id") @db.Uuid
+  meeting        Meeting  @relation(fields: [organizationId, meetingId], references: [organizationId, id], onDelete: Cascade)
+  type           String   @db.VarChar(64) /// e.g. participant_joined, recording_started
+  actorUserId    String?  @map("actor_user_id") @db.Uuid /// → identity.users (logical)
+  payload        Json     @default("{}") @db.JsonB
+  occurredAt     DateTime @default(now()) @map("occurred_at") @db.Timestamptz(3)
+
+  @@index([meetingId, occurredAt])
+  @@index([organizationId, occurredAt])
+  @@map("meeting_events")
+}
+
+// ---------------------------------------------------------------------------
+// Messaging infrastructure (identical in every service schema)
+// ---------------------------------------------------------------------------
+
+/// Transactional outbox. Domain events are inserted in the SAME transaction as the state change and
+/// published afterwards by this service's relay. The durable source of events (Redis never is).
+/// Not tenant-filtered: the relay processes all organizations.
+model OutboxEvent {
+  id             String    @id @default(uuid(7)) @db.Uuid /// event id, time-ordered
+  aggregateType  String    @map("aggregate_type") @db.VarChar(64)
+  aggregateId    String    @map("aggregate_id") @db.Uuid
+  eventType      String    @map("event_type") @db.VarChar(128) /// e.g. "<service>.<entity>.<past_tense_verb>"
+  eventVersion   Int       @default(1) @map("event_version") @db.SmallInt
+  organizationId String?   @map("organization_id") @db.Uuid /// routing only; null for global events
+  payload        Json      @db.JsonB
+  headers        Json      @default("{}") @db.JsonB /// correlation / trace ids
+  occurredAt     DateTime  @default(now()) @map("occurred_at") @db.Timestamptz(3)
+  publishedAt    DateTime? @map("published_at") @db.Timestamptz(3)
+  attempts       Int       @default(0)
+  lastError      String?   @map("last_error") @db.VarChar(2000)
+
+  @@index([occurredAt], map: "outbox_events_unpublished_idx", where: raw("published_at IS NULL"))
+  @@index([publishedAt], map: "outbox_events_published_idx", where: raw("published_at IS NOT NULL"))
+  @@map("outbox_events")
+}
+
+/// Idempotent-consumer log: one row per (event, handler) successfully processed.
+model ProcessedEvent {
+  eventId     String   @map("event_id") @db.Uuid
+  handler     String   @db.VarChar(128)
+  processedAt DateTime @default(now()) @map("processed_at") @db.Timestamptz(3)
+
+  @@id([eventId, handler])
+  @@index([processedAt])
+  @@map("processed_events")
+}

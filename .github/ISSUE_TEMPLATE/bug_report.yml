@@ -1,0 +1,67 @@
+name: Bug report
+description: Something is broken or behaves unexpectedly.
+labels: ['bug']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Security vulnerabilities must not be reported here.** Follow SECURITY.md instead.
+        Never paste secrets, tokens, `.env` contents or real customer data.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Frontend: web
+        - Frontend: mobile
+        - Backend service
+        - API gateway
+        - Database / migrations
+        - Infrastructure / Docker
+        - CI / tooling
+        - Documentation
+    validations:
+      required: true
+  - type: input
+    id: service
+    attributes:
+      label: Service(s), if backend
+      placeholder: e.g. messaging, workspace
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Include exact error messages and log excerpts (redacted).
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. make infra-up
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      options:
+        - Critical (data loss, cross-tenant exposure, outage)
+        - High (core flow broken, no workaround)
+        - Medium (workaround exists)
+        - Low (cosmetic / minor)
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: 'Branch/commit, OS, Node version (node -v), browser/device'

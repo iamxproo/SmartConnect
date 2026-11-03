@@ -1,0 +1,153 @@
+// =============================================================================
+// Integrations service: sole owner of PostgreSQL schema "integrations".
+//   Design & rationale : docs/database/schema-design.md#integrations
+//   Tenant isolation   : docs/database/tenant-isolation.md
+// Conventions: UUIDv7 primary keys, snake_case tables/columns, timestamptz(3).
+// Cross-service references are plain UUID columns WITHOUT foreign keys, annotated
+// "→ <service>.<table> (logical)"; consistency across services is eventual (outbox events).
+// RLS policies, CHECK constraints, triggers and functions are hand-written SQL appended to the
+// migrations, because Prisma does not model them.
+// =============================================================================
+
+generator client {
+  provider            = "prisma-client"
+  output              = "../src/generated/prisma"
+  moduleFormat        = "esm"
+  importFileExtension = "js"
+  previewFeatures     = ["partialIndexes"]
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// Third-party connections and outgoing webhooks. The candidate `integrations` catalog table is not
+// created: the provider catalog is versioned with code (`provider` is a registry key), avoiding a
+// global, non-tenant table. Incoming webhooks are deferred (they need a cross-tenant token lookup).
+// Secrets are stored ONLY as envelope-encrypted ciphertext (AES-256-GCM data key wrapped by a KMS key).
+
+enum ConnectionStatus {
+  active
+  disabled
+  error
+  revoked
+}
+
+enum WebhookDeliveryStatus {
+  pending
+  sending
+  succeeded
+  failed /// retryable
+  abandoned /// retries exhausted
+}
+
+model IntegrationConnection {
+  id                    String           @id @default(uuid(7)) @db.Uuid
+  organizationId        String           @map("organization_id") @db.Uuid /// → organization.organizations (logical)
+  provider              String           @db.VarChar(64) /// code-defined registry key, e.g. "github"
+  status                ConnectionStatus @default(active)
+  displayName           String?          @map("display_name") @db.VarChar(120)
+  externalAccountId     String?          @map("external_account_id") @db.VarChar(255)
+  scopes                String[]
+  credentialsCiphertext Bytes?           @map("credentials_ciphertext")
+  credentialsKeyId      String?          @map("credentials_key_id") @db.VarChar(255) /// KMS key + version that wrapped the data key
+  config                Json             @default("{}") @db.JsonB
+  installedByUserId     String           @map("installed_by_user_id") @db.Uuid /// → identity.users (logical)
+  lastSyncedAt          DateTime?        @map("last_synced_at") @db.Timestamptz(3)
+  revokedAt             DateTime?        @map("revoked_at") @db.Timestamptz(3)
+  createdAt             DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt             DateTime         @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  webhooks Webhook[]
+
+  @@unique([organizationId, id])
+  @@unique([organizationId, provider, externalAccountId])
+  @@map("integration_connections")
+}
+
+/// Outgoing webhook subscription. Payloads are signed with HMAC-SHA256 using the decrypted secret.
+model Webhook {
+  id               String                 @id @default(uuid(7)) @db.Uuid
+  organizationId   String                 @map("organization_id") @db.Uuid
+  connectionId     String?                @map("connection_id") @db.Uuid
+  connection       IntegrationConnection? @relation(fields: [organizationId, connectionId], references: [organizationId, id], onDelete: Cascade)
+  name             String                 @db.VarChar(120)
+  targetUrl        String                 @map("target_url") @db.VarChar(2048) /// https only (CHECK); SSRF-filtered by the service
+  eventTypes       String[]               @map("event_types")
+  secretCiphertext Bytes                  @map("secret_ciphertext")
+  secretKeyId      String                 @map("secret_key_id") @db.VarChar(255)
+  isEnabled        Boolean                @default(true) @map("is_enabled")
+  failureCount     Int                    @default(0) @map("failure_count") /// consecutive failures → auto-disable
+  createdByUserId  String                 @map("created_by_user_id") @db.Uuid /// → identity.users (logical)
+  disabledAt       DateTime?              @map("disabled_at") @db.Timestamptz(3)
+  createdAt        DateTime               @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime               @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  deliveries WebhookDelivery[]
+
+  @@unique([organizationId, id])
+  @@index([organizationId, isEnabled])
+  @@map("webhooks")
+}
+
+model WebhookDelivery {
+  id                  String                @id @default(uuid(7)) @db.Uuid
+  organizationId      String                @map("organization_id") @db.Uuid
+  webhookId           String                @map("webhook_id") @db.Uuid
+  webhook             Webhook               @relation(fields: [organizationId, webhookId], references: [organizationId, id], onDelete: Cascade)
+  eventId             String                @map("event_id") @db.Uuid /// source outbox event (idempotency)
+  eventType           String                @map("event_type") @db.VarChar(128)
+  payload             Json                  @db.JsonB
+  status              WebhookDeliveryStatus @default(pending)
+  attemptCount        Int                   @default(0) @map("attempt_count")
+  nextAttemptAt       DateTime?             @default(now()) @map("next_attempt_at") @db.Timestamptz(3)
+  lockedUntil         DateTime?             @map("locked_until") @db.Timestamptz(3)
+  responseStatus      Int?                  @map("response_status") @db.SmallInt
+  responseBodyExcerpt String?               @map("response_body_excerpt") @db.VarChar(1024)
+  lastError           String?               @map("last_error") @db.VarChar(1000)
+  deliveredAt         DateTime?             @map("delivered_at") @db.Timestamptz(3)
+  createdAt           DateTime              @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt           DateTime              @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([webhookId, eventId])
+  @@index([webhookId, createdAt(sort: Desc)])
+  @@index([nextAttemptAt], map: "webhook_deliveries_due_idx", where: raw("status = 'pending' OR status = 'failed' OR status = 'sending'"))
+  @@map("webhook_deliveries")
+}
+
+// ---------------------------------------------------------------------------
+// Messaging infrastructure (identical in every service schema)
+// ---------------------------------------------------------------------------
+
+/// Transactional outbox. Domain events are inserted in the SAME transaction as the state change and
+/// published afterwards by this service's relay. The durable source of events (Redis never is).
+/// Not tenant-filtered: the relay processes all organizations.
+model OutboxEvent {
+  id             String    @id @default(uuid(7)) @db.Uuid /// event id, time-ordered
+  aggregateType  String    @map("aggregate_type") @db.VarChar(64)
+  aggregateId    String    @map("aggregate_id") @db.Uuid
+  eventType      String    @map("event_type") @db.VarChar(128) /// e.g. "<service>.<entity>.<past_tense_verb>"
+  eventVersion   Int       @default(1) @map("event_version") @db.SmallInt
+  organizationId String?   @map("organization_id") @db.Uuid /// routing only; null for global events
+  payload        Json      @db.JsonB
+  headers        Json      @default("{}") @db.JsonB /// correlation / trace ids
+  occurredAt     DateTime  @default(now()) @map("occurred_at") @db.Timestamptz(3)
+  publishedAt    DateTime? @map("published_at") @db.Timestamptz(3)
+  attempts       Int       @default(0)
+  lastError      String?   @map("last_error") @db.VarChar(2000)
+
+  @@index([occurredAt], map: "outbox_events_unpublished_idx", where: raw("published_at IS NULL"))
+  @@index([publishedAt], map: "outbox_events_published_idx", where: raw("published_at IS NOT NULL"))
+  @@map("outbox_events")
+}
+
+/// Idempotent-consumer log: one row per (event, handler) successfully processed.
+model ProcessedEvent {
+  eventId     String   @map("event_id") @db.Uuid
+  handler     String   @db.VarChar(128)
+  processedAt DateTime @default(now()) @map("processed_at") @db.Timestamptz(3)
+
+  @@id([eventId, handler])
+  @@index([processedAt])
+  @@map("processed_events")
+}

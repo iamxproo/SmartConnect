@@ -1,0 +1,9 @@
+{
+  "editor.formatOnSave": true,
+  "editor.defaultFormatter": "esbenp.prettier-vscode",
+  "[prisma]": { "editor.defaultFormatter": "Prisma.prisma" },
+  "editor.codeActionsOnSave": { "source.fixAll.eslint": "explicit" },
+  "typescript.tsdk": "node_modules/typescript/lib",
+  "files.exclude": { "**/src/generated": false },
+  "search.exclude": { "**/src/generated": true, "**/node_modules": true, "infrastructure/backup/output": true }
+}

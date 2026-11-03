@@ -1,0 +1,146 @@
+# Code quality gates for every pull request and for pushes to main/develop.
+# Database migration and security suites live in database.yml; dependency security in security.yml.
+# Third-party actions are pinned to full commit SHAs (version in the trailing comment); Dependabot
+# keeps them current. Details: docs/devops/ci.md
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main, develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PRISMA_HIDE_UPDATE_MESSAGE: '1'
+
+jobs:
+  detect:
+    name: Detect projects
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      web: ${{ steps.detect.outputs.web }}
+      mobile: ${{ steps.detect.outputs.mobile }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: detect
+        name: Which frontend apps exist?
+        run: |
+          echo '### Frontend projects' >> "$GITHUB_STEP_SUMMARY"
+          for app in web mobile; do
+            if [ -f "smartconnect-frontend/$app/package.json" ]; then
+              echo "$app=true" >> "$GITHUB_OUTPUT"
+              echo "- \`smartconnect-frontend/$app\`: present, checked by job *Frontend $app*" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "$app=false" >> "$GITHUB_OUTPUT"
+              echo "- \`smartconnect-frontend/$app\`: **NOT CHECKED, no project exists yet** (job is skipped, not passed)" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
+  quality:
+    name: Format & lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - name: Prettier
+        run: npm run format:check
+      - name: Generate Prisma clients (type-aware lint needs them)
+        run: npm run prisma:generate
+      # `prelint` builds @smartconnect/backend-kit first: its type declarations are needed for type-aware rules.
+      - name: ESLint (zero warnings)
+        run: npm run lint
+
+  backend:
+    name: Backend (schemas, typecheck, unit tests, build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - name: Validate Prisma schemas
+        run: npm run prisma:validate
+      - name: Generate Prisma clients
+        run: npm run prisma:generate
+      # Each backend workspace is targeted explicitly and WITHOUT --if-present: a service that lacks
+      # a typecheck/build script fails the job instead of being silently skipped.
+      - name: Type-check backend workspaces
+        run: for d in smartconnect-backend/packages/*/ smartconnect-backend/services/*/ smartconnect-backend/scripts/ smartconnect-backend/api-gateway/ smartconnect-backend/realtime-gateway/; do npm run typecheck --workspace "${d%/}"; done
+      - name: Type-check tests
+        run: npm run typecheck --workspace tests
+      - name: Unit tests (no database)
+        run: npm run test:unit
+      # In-process tests: no database, Docker or network. The identity service's database-backed integration
+      # suites (and the gateway against a real identity service) run in database.yml.
+      - name: Backend kit tests
+        run: npm run test --workspace smartconnect-backend/packages/backend-kit
+      - name: API gateway tests
+        run: npm run test --workspace smartconnect-backend/api-gateway
+      - name: Identity service unit tests
+        run: npm run test --workspace smartconnect-backend/services/identity
+      - name: Organization service unit tests
+        run: npm run test --workspace smartconnect-backend/services/organization
+      - name: Workspace service unit tests
+        run: npm run test --workspace smartconnect-backend/services/workspace
+      - name: Messaging service unit tests
+        run: npm run test --workspace smartconnect-backend/services/messaging
+      - name: Realtime gateway tests
+        run: npm run test --workspace smartconnect-backend/realtime-gateway
+      - name: Build shared packages, services and API gateway
+        run: for d in smartconnect-backend/packages/*/ smartconnect-backend/services/*/ smartconnect-backend/api-gateway/ smartconnect-backend/realtime-gateway/; do npm run build --workspace "${d%/}"; done
+
+  frontend-web:
+    name: Frontend web
+    needs: detect
+    if: needs.detect.outputs.web == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      # Shared frontend packages (design tokens incl. WCAG contrast + generated-CSS drift, UI primitives).
+      - name: Frontend packages (typecheck, test)
+        run: for d in smartconnect-frontend/packages/*/; do npm run typecheck --workspace "${d%/}"; npm run test --workspace "${d%/}"; done
+      # Required scripts (no --if-present): a missing one fails the job. Formatting is covered by "quality".
+      - run: npm run lint --workspace smartconnect-frontend/web
+      - run: npm run typecheck --workspace smartconnect-frontend/web
+      - run: npm run test --workspace smartconnect-frontend/web
+      - run: npm run build --workspace smartconnect-frontend/web
+
+  frontend-mobile:
+    name: Frontend mobile
+    needs: detect
+    if: needs.detect.outputs.mobile == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm run lint --workspace smartconnect-frontend/mobile
+      - run: npm run typecheck --workspace smartconnect-frontend/mobile
+      - run: npm run test --workspace smartconnect-frontend/mobile
+      - run: npm run build --workspace smartconnect-frontend/mobile

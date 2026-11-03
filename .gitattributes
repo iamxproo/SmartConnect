@@ -1,0 +1,18 @@
+# Normalise line endings: the repository stores LF; shell scripts must stay LF on every OS.
+* text=auto eol=lf
+*.sh text eol=lf
+Makefile text eol=lf
+
+# Binary assets
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.dump binary
+
+# Generated / lock files: hide noisy diffs in reviews
+package-lock.json linguist-generated=true -diff

@@ -1,0 +1,59 @@
+# Dependency security. Runs on PRs, on pushes to main/develop, and weekly, because new advisories
+# appear for code that has not changed. Details: docs/devops/ci.md#security
+name: security
+
+on:
+  pull_request:
+  push:
+    branches: [main, develop]
+  schedule:
+    - cron: '0 6 * * 1' # Mondays 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  npm-audit:
+    name: npm audit + registry signatures
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - name: Install without running lifecycle scripts
+        run: npm ci --ignore-scripts
+      - name: Runtime dependencies, fail on moderate or higher
+        run: npm audit --omit=dev --audit-level=moderate
+      - name: Full tree (incl. dev tooling), fail on high or critical
+        run: npm audit --audit-level=high
+      - name: Report every finding, including tolerated lower-severity dev-tool advisories
+        if: always()
+        run: |
+          {
+            echo '### npm audit (all severities)'
+            echo '```'
+            npm audit || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Verify registry signatures and provenance attestations
+        run: npm audit signatures
+
+  dependency-review:
+    name: Dependency review (PR diff)
+    # GitHub's dependency review needs the dependency graph; on private repositories it also needs
+    # GitHub Advanced Security. It is skipped (shown as skipped, never as passed) where unavailable.
+    if: github.event_name == 'pull_request' && !github.event.repository.private
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high

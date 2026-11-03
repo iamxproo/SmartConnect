@@ -1,0 +1,128 @@
+// =============================================================================
+// Documents service: sole owner of PostgreSQL schema "documents".
+//   Design & rationale : docs/database/schema-design.md#documents
+//   Tenant isolation   : docs/database/tenant-isolation.md
+// Conventions: UUIDv7 primary keys, snake_case tables/columns, timestamptz(3).
+// Cross-service references are plain UUID columns WITHOUT foreign keys, annotated
+// "→ <service>.<table> (logical)"; consistency across services is eventual (outbox events).
+// RLS policies, CHECK constraints, triggers and functions are hand-written SQL appended to the
+// migrations, because Prisma does not model them.
+// =============================================================================
+
+generator client {
+  provider            = "prisma-client"
+  output              = "../src/generated/prisma"
+  moduleFormat        = "esm"
+  importFileExtension = "js"
+  previewFeatures     = ["partialIndexes"]
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// Collaborative documents. Real-time co-editing state (Yjs updates) is out of scope for this phase;
+// document_versions stores durable snapshots.
+
+enum DocumentVisibility {
+  private /// owner + explicitly shared (future)
+  workspace /// members of workspace_id
+  organization /// every organization member
+}
+
+model Document {
+  id                   String             @id @default(uuid(7)) @db.Uuid
+  organizationId       String             @map("organization_id") @db.Uuid /// → organization.organizations (logical)
+  workspaceId          String?            @map("workspace_id") @db.Uuid /// → workspace.workspaces (logical)
+  ownerUserId          String             @map("owner_user_id") @db.Uuid /// → identity.users (logical)
+  title                String             @db.VarChar(300)
+  visibility           DocumentVisibility @default(private)
+  currentVersionNumber Int                @default(0) @map("current_version_number")
+  createdAt            DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt            DateTime           @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+  archivedAt           DateTime?          @map("archived_at") @db.Timestamptz(3)
+  deletedAt            DateTime?          @map("deleted_at") @db.Timestamptz(3)
+
+  versions DocumentVersion[]
+  comments DocumentComment[]
+
+  @@unique([organizationId, id])
+  @@index([organizationId, workspaceId, updatedAt(sort: Desc)])
+  @@index([organizationId, ownerUserId, updatedAt(sort: Desc)])
+  @@map("documents")
+}
+
+model DocumentVersion {
+  id             String   @id @default(uuid(7)) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  documentId     String   @map("document_id") @db.Uuid
+  document       Document @relation(fields: [organizationId, documentId], references: [organizationId, id], onDelete: Cascade)
+  versionNumber  Int      @map("version_number")
+  content        Json     @db.JsonB /// editor document (ProseMirror JSON)
+  authorUserId   String   @map("author_user_id") @db.Uuid /// → identity.users (logical)
+  changeSummary  String?  @map("change_summary") @db.VarChar(500)
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@unique([documentId, versionNumber])
+  @@map("document_versions")
+}
+
+model DocumentComment {
+  id               String           @id @default(uuid(7)) @db.Uuid
+  organizationId   String           @map("organization_id") @db.Uuid
+  documentId       String           @map("document_id") @db.Uuid
+  document         Document         @relation(fields: [organizationId, documentId], references: [organizationId, id], onDelete: Cascade)
+  parentCommentId  String?          @map("parent_comment_id") @db.Uuid
+  parentComment    DocumentComment? @relation("CommentReplies", fields: [organizationId, parentCommentId], references: [organizationId, id], onDelete: Cascade)
+  authorUserId     String           @map("author_user_id") @db.Uuid /// → identity.users (logical)
+  body             String           @db.VarChar(10000)
+  anchor           Json?            @db.JsonB /// selection/range the comment is attached to
+  resolvedAt       DateTime?        @map("resolved_at") @db.Timestamptz(3)
+  resolvedByUserId String?          @map("resolved_by_user_id") @db.Uuid /// → identity.users (logical)
+  createdAt        DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime         @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+  deletedAt        DateTime?        @map("deleted_at") @db.Timestamptz(3)
+
+  replies DocumentComment[] @relation("CommentReplies")
+
+  @@unique([organizationId, id])
+  @@index([documentId, createdAt])
+  @@map("document_comments")
+}
+
+// ---------------------------------------------------------------------------
+// Messaging infrastructure (identical in every service schema)
+// ---------------------------------------------------------------------------
+
+/// Transactional outbox. Domain events are inserted in the SAME transaction as the state change and
+/// published afterwards by this service's relay. The durable source of events (Redis never is).
+/// Not tenant-filtered: the relay processes all organizations.
+model OutboxEvent {
+  id             String    @id @default(uuid(7)) @db.Uuid /// event id, time-ordered
+  aggregateType  String    @map("aggregate_type") @db.VarChar(64)
+  aggregateId    String    @map("aggregate_id") @db.Uuid
+  eventType      String    @map("event_type") @db.VarChar(128) /// e.g. "<service>.<entity>.<past_tense_verb>"
+  eventVersion   Int       @default(1) @map("event_version") @db.SmallInt
+  organizationId String?   @map("organization_id") @db.Uuid /// routing only; null for global events
+  payload        Json      @db.JsonB
+  headers        Json      @default("{}") @db.JsonB /// correlation / trace ids
+  occurredAt     DateTime  @default(now()) @map("occurred_at") @db.Timestamptz(3)
+  publishedAt    DateTime? @map("published_at") @db.Timestamptz(3)
+  attempts       Int       @default(0)
+  lastError      String?   @map("last_error") @db.VarChar(2000)
+
+  @@index([occurredAt], map: "outbox_events_unpublished_idx", where: raw("published_at IS NULL"))
+  @@index([publishedAt], map: "outbox_events_published_idx", where: raw("published_at IS NOT NULL"))
+  @@map("outbox_events")
+}
+
+/// Idempotent-consumer log: one row per (event, handler) successfully processed.
+model ProcessedEvent {
+  eventId     String   @map("event_id") @db.Uuid
+  handler     String   @db.VarChar(128)
+  processedAt DateTime @default(now()) @map("processed_at") @db.Timestamptz(3)
+
+  @@id([eventId, handler])
+  @@index([processedAt])
+  @@map("processed_events")
+}

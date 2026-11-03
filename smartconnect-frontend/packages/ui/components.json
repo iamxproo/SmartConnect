@@ -1,0 +1,20 @@
+{
+  "$schema": "https://ui.shadcn.com/schema.json",
+  "style": "new-york",
+  "rsc": false,
+  "tsx": true,
+  "tailwind": {
+    "config": "",
+    "css": "src/styles.css",
+    "baseColor": "neutral",
+    "cssVariables": true
+  },
+  "iconLibrary": "lucide",
+  "aliases": {
+    "components": "@smartconnect/ui/components",
+    "ui": "@smartconnect/ui/components",
+    "utils": "@smartconnect/ui/lib/utils",
+    "lib": "@smartconnect/ui/lib",
+    "hooks": "@smartconnect/ui/hooks"
+  }
+}

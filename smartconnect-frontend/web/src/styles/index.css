@@ -1,0 +1,39 @@
+@import 'tailwindcss';
+@import '@smartconnect/design-tokens/tokens.css';
+@import '@smartconnect/design-tokens/tailwind-theme.css';
+@import '@smartconnect/ui/styles.css';
+
+/* `dark:` follows the data-theme attribute (set by public/theme-init.js and ThemeProvider), not the media
+   query, so an explicit Light/Dark choice wins over the OS. Tokens already switch automatically. */
+@custom-variant dark (&:where([data-theme='dark'], [data-theme='dark'] *));
+
+@layer base {
+  html {
+    font-family: var(--sc-font-sans);
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    @apply bg-background text-base text-foreground antialiased;
+  }
+
+  /* Fallback focus indicator for elements without their own ring styles. */
+  :focus-visible {
+    outline: 2px solid var(--sc-color-focus-ring);
+    outline-offset: 2px;
+  }
+
+  ::selection {
+    background-color: var(--sc-color-surface-selected);
+  }
+}
+
+/* Token durations already drop to 0ms; this also stops looping animations (e.g. skeleton pulse). */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  ::before,
+  ::after {
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+  }
+}

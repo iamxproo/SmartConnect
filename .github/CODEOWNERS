@@ -1,0 +1,25 @@
+# CODEOWNERS — INACTIVE TEMPLATE. Every rule below is commented out on purpose: GitHub cannot resolve
+# owners until the organisation's teams exist. To activate, create the teams (or use usernames), replace
+# the placeholders, uncomment, and enable "Require review from Code Owners" on protected branches.
+# Recommendations and rationale: docs/devops/github-repository-setup.md#codeowners
+#
+# Later rules override earlier ones, so the broad default comes first.
+
+# * @ORG/smartconnect-maintainers
+
+# --- Security-sensitive: always reviewed by platform/database owners ---------------------------
+# /infrastructure/                                   @ORG/smartconnect-platform
+# /infrastructure/compose/postgres/                  @ORG/smartconnect-platform @ORG/smartconnect-db-owners
+# /smartconnect-backend/services/*/prisma/           @ORG/smartconnect-db-owners
+# /smartconnect-backend/services/*/src/database/     @ORG/smartconnect-db-owners
+# /tests/security/                                   @ORG/smartconnect-db-owners
+# /docs/database/                                    @ORG/smartconnect-db-owners
+# /.github/                                          @ORG/smartconnect-platform
+# /package.json                                      @ORG/smartconnect-platform
+# /package-lock.json                                 @ORG/smartconnect-platform
+# /SECURITY.md                                       @ORG/smartconnect-platform
+
+# --- Product code ------------------------------------------------------------------------------
+# /smartconnect-backend/                             @ORG/smartconnect-backend
+# /smartconnect-frontend/                            @ORG/smartconnect-frontend
+# /packages/                                         @ORG/smartconnect-backend @ORG/smartconnect-frontend

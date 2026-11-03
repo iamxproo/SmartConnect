@@ -1,0 +1,39 @@
+{
+  "name": "@smartconnect/ui",
+  "version": "0.0.0",
+  "private": true,
+  "description": "SmartConnect web UI primitives: shadcn/ui-convention components (Radix + cva) themed with @smartconnect/design-tokens. Consumed as source.",
+  "type": "module",
+  "exports": {
+    "./components/*": "./src/components/*.tsx",
+    "./lib/*": "./src/lib/*.ts",
+    "./styles.css": "./src/styles.css"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "class-variance-authority": "0.7.1",
+    "clsx": "2.1.1",
+    "lucide-react": "1.61.0",
+    "radix-ui": "1.8.1",
+    "tailwind-merge": "3.7.0"
+  },
+  "peerDependencies": {
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@testing-library/dom": "10.4.2",
+    "@testing-library/jest-dom": "7.0.1",
+    "@testing-library/react": "16.3.3",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "jsdom": "29.1.1",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "typescript": "6.0.3",
+    "vitest": "5.0.5"
+  }
+}

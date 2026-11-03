@@ -1,0 +1,48 @@
+{
+  "name": "@smartconnect/files-service",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "prisma:validate": "prisma validate",
+    "prisma:format": "prisma format",
+    "prisma:generate": "prisma generate",
+    "db:migrate:deploy": "prisma migrate deploy",
+    "db:migrate:status": "prisma migrate status",
+    "prebuild": "npm run build --workspace @smartconnect/backend-kit",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node --env-file-if-exists=.env dist/main.js",
+    "pretypecheck": "npm run build --workspace @smartconnect/backend-kit",
+    "typecheck": "tsc -p tsconfig.json",
+    "pretest": "npm run build --workspace @smartconnect/backend-kit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@nestjs/common": "12.2.0",
+    "@nestjs/core": "12.2.0",
+    "@nestjs/platform-express": "12.2.0",
+    "@nestjs/swagger": "12.0.4",
+    "@prisma/adapter-pg": "7.10.1",
+    "@prisma/client": "7.10.1",
+    "@smartconnect/backend-kit": "0.0.0",
+    "class-transformer": "0.5.1",
+    "class-validator": "0.15.1",
+    "pg": "8.23.1",
+    "reflect-metadata": "0.2.2",
+    "rxjs": "7.8.2"
+  },
+  "devDependencies": {
+    "@types/express": "5.0.6",
+    "@types/node": "22.20.5",
+    "@types/pg": "8.23.1",
+    "@types/supertest": "7.2.1",
+    "prisma": "7.10.1",
+    "supertest": "7.3.1",
+    "typescript": "6.0.3",
+    "vitest": "5.0.5"
+  },
+  "description": "Files service: sole owner of the files schema. File metadata and bytes (local-filesystem storage driver), uploader-only and attachment-derived access. Internal HTTP API behind the API gateway.",
+  "engines": {
+    "node": ">=22.13"
+  }
+}

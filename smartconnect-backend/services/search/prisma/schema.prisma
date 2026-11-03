@@ -1,0 +1,123 @@
+// =============================================================================
+// Search service: sole owner of PostgreSQL schema "search".
+//   Design & rationale : docs/database/schema-design.md#search
+//   Tenant isolation   : docs/database/tenant-isolation.md
+// Conventions: UUIDv7 primary keys, snake_case tables/columns, timestamptz(3).
+// Cross-service references are plain UUID columns WITHOUT foreign keys, annotated
+// "→ <service>.<table> (logical)"; consistency across services is eventual (outbox events).
+// RLS policies, CHECK constraints, triggers and functions are hand-written SQL appended to the
+// migrations, because Prisma does not model them.
+// =============================================================================
+
+generator client {
+  provider            = "prisma-client"
+  output              = "../src/generated/prisma"
+  moduleFormat        = "esm"
+  importFileExtension = "js"
+  previewFeatures     = ["partialIndexes"]
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// Search owns a denormalized index built from other services' events — it never reads their schemas.
+// PostgreSQL full-text search ('simple' config: language-neutral, no stemming) is sufficient for
+// ~1 500 users; a dedicated engine (OpenSearch/Meilisearch) can replace search_documents later.
+
+enum SearchSourceType {
+  message
+  file
+  document
+  task
+  channel
+  meeting
+}
+
+/// Indexed projection of a searchable resource. access_scope_ids lists the containers that grant read
+/// access (conversation/channel/workspace ids…); every query must intersect them with the caller's scopes.
+model SearchDocument {
+  id              String                   @id @default(uuid(7)) @db.Uuid
+  organizationId  String                   @map("organization_id") @db.Uuid /// → organization.organizations (logical)
+  sourceType      SearchSourceType         @map("source_type")
+  sourceId        String                   @map("source_id") @db.Uuid /// id in the owning service (logical)
+  workspaceId     String?                  @map("workspace_id") @db.Uuid /// → workspace.workspaces (logical)
+  accessScopeIds  String[]                 @map("access_scope_ids") @db.Uuid
+  title           String?                  @db.VarChar(500)
+  body            String /// plain text, truncated by the indexer
+  searchVector    Unsupported("tsvector")? @map("search_vector") /// maintained by the indexer in the same statement as body
+  sourceUpdatedAt DateTime                 @map("source_updated_at") @db.Timestamptz(3) /// ignore out-of-order events
+  createdAt       DateTime                 @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime                 @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([organizationId, sourceType, sourceId])
+  @@index([searchVector], type: Gin)
+  @@index([accessScopeIds], type: Gin)
+  @@map("search_documents")
+}
+
+model SavedSearch {
+  id             String   @id @default(uuid(7)) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  userId         String   @map("user_id") @db.Uuid /// → identity.users (logical)
+  name           String   @db.VarChar(120)
+  query          String   @db.VarChar(500)
+  filters        Json     @default("{}") @db.JsonB
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@index([organizationId, userId])
+  @@map("saved_searches")
+}
+
+/// Recent searches for suggestions. Personal data → short retention (default 30 days).
+model SearchHistory {
+  id             String   @id @default(uuid(7)) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  userId         String   @map("user_id") @db.Uuid /// → identity.users (logical)
+  query          String   @db.VarChar(500)
+  filters        Json     @default("{}") @db.JsonB
+  resultCount    Int?     @map("result_count")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([organizationId, userId, createdAt(sort: Desc)])
+  @@index([organizationId, createdAt])
+  @@map("search_history")
+}
+
+// ---------------------------------------------------------------------------
+// Messaging infrastructure (identical in every service schema)
+// ---------------------------------------------------------------------------
+
+/// Transactional outbox. Domain events are inserted in the SAME transaction as the state change and
+/// published afterwards by this service's relay. The durable source of events (Redis never is).
+/// Not tenant-filtered: the relay processes all organizations.
+model OutboxEvent {
+  id             String    @id @default(uuid(7)) @db.Uuid /// event id, time-ordered
+  aggregateType  String    @map("aggregate_type") @db.VarChar(64)
+  aggregateId    String    @map("aggregate_id") @db.Uuid
+  eventType      String    @map("event_type") @db.VarChar(128) /// e.g. "<service>.<entity>.<past_tense_verb>"
+  eventVersion   Int       @default(1) @map("event_version") @db.SmallInt
+  organizationId String?   @map("organization_id") @db.Uuid /// routing only; null for global events
+  payload        Json      @db.JsonB
+  headers        Json      @default("{}") @db.JsonB /// correlation / trace ids
+  occurredAt     DateTime  @default(now()) @map("occurred_at") @db.Timestamptz(3)
+  publishedAt    DateTime? @map("published_at") @db.Timestamptz(3)
+  attempts       Int       @default(0)
+  lastError      String?   @map("last_error") @db.VarChar(2000)
+
+  @@index([occurredAt], map: "outbox_events_unpublished_idx", where: raw("published_at IS NULL"))
+  @@index([publishedAt], map: "outbox_events_published_idx", where: raw("published_at IS NOT NULL"))
+  @@map("outbox_events")
+}
+
+/// Idempotent-consumer log: one row per (event, handler) successfully processed.
+model ProcessedEvent {
+  eventId     String   @map("event_id") @db.Uuid
+  handler     String   @db.VarChar(128)
+  processedAt DateTime @default(now()) @map("processed_at") @db.Timestamptz(3)
+
+  @@id([eventId, handler])
+  @@index([processedAt])
+  @@map("processed_events")
+}

@@ -1,0 +1,145 @@
+// =============================================================================
+// Administration service: sole owner of PostgreSQL schema "administration".
+//   Design & rationale : docs/database/schema-design.md#administration
+//   Tenant isolation   : docs/database/tenant-isolation.md
+// Conventions: UUIDv7 primary keys, snake_case tables/columns, timestamptz(3).
+// Cross-service references are plain UUID columns WITHOUT foreign keys, annotated
+// "→ <service>.<table> (logical)"; consistency across services is eventual (outbox events).
+// RLS policies, CHECK constraints, triggers and functions are hand-written SQL appended to the
+// migrations, because Prisma does not model them.
+// =============================================================================
+
+generator client {
+  provider            = "prisma-client"
+  output              = "../src/generated/prisma"
+  moduleFormat        = "esm"
+  importFileExtension = "js"
+  previewFeatures     = ["partialIndexes"]
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// Organization governance: the central audit trail (fed by every service's outbox), security policies
+// and retention policies.
+
+enum AuditActorType {
+  user
+  service
+  system
+  api_key
+}
+
+enum AuditOutcome {
+  success
+  failure
+  denied
+}
+
+enum RetentionResource {
+  messages
+  files
+  meeting_recordings
+  meeting_events
+  notifications
+  search_history
+  webhook_deliveries
+  workflow_executions
+  audit_logs
+}
+
+/// Append-only. UPDATE/DELETE are revoked from the runtime role (bootstrap) AND blocked by a trigger for
+/// every role except the schema owner (used only by the retention purge). organization_id NULL marks a
+/// platform-scope event (e.g. authentication), never visible to tenants.
+model AuditLog {
+  id             String         @id @default(uuid(7)) @db.Uuid
+  organizationId String?        @map("organization_id") @db.Uuid /// → organization.organizations (logical)
+  eventId        String         @unique @map("event_id") @db.Uuid /// source outbox event id → idempotent ingestion
+  occurredAt     DateTime       @map("occurred_at") @db.Timestamptz(3)
+  sourceService  String         @map("source_service") @db.VarChar(32)
+  actorType      AuditActorType @map("actor_type")
+  actorId        String?        @map("actor_id") @db.Uuid
+  actorIp        String?        @map("actor_ip") @db.Inet
+  actorUserAgent String?        @map("actor_user_agent") @db.VarChar(512)
+  action         String         @db.VarChar(128) /// e.g. organization.member.role_changed
+  resourceType   String         @map("resource_type") @db.VarChar(64)
+  resourceId     String?        @map("resource_id") @db.Uuid
+  outcome        AuditOutcome   @default(success)
+  requestId      String?        @map("request_id") @db.VarChar(64)
+  metadata       Json           @default("{}") @db.JsonB /// before/after diff; secrets and message bodies redacted
+  createdAt      DateTime       @default(now()) @map("created_at") @db.Timestamptz(3) /// ingestion time
+
+  @@index([organizationId, occurredAt(sort: Desc)])
+  @@index([organizationId, resourceType, resourceId, occurredAt])
+  @@index([organizationId, actorId, occurredAt])
+  @@map("audit_logs")
+}
+
+/// Typed-by-key organization security settings (authentication, session, password, sharing,
+/// ip_allowlist…). `settings` is validated against a versioned schema by the service.
+model SecurityPolicy {
+  id              String   @id @default(uuid(7)) @db.Uuid
+  organizationId  String   @map("organization_id") @db.Uuid
+  policyKey       String   @map("policy_key") @db.VarChar(64)
+  settings        Json     @db.JsonB
+  version         Int      @default(1) /// optimistic concurrency
+  updatedByUserId String   @map("updated_by_user_id") @db.Uuid /// → identity.users (logical)
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([organizationId, policyKey])
+  @@map("security_policies")
+}
+
+/// Per-organization retention. NULL retention_days = keep indefinitely; legal_hold suspends purging.
+model RetentionPolicy {
+  id              String            @id @default(uuid(7)) @db.Uuid
+  organizationId  String            @map("organization_id") @db.Uuid
+  resourceType    RetentionResource @map("resource_type")
+  retentionDays   Int?              @map("retention_days")
+  legalHold       Boolean           @default(false) @map("legal_hold")
+  updatedByUserId String            @map("updated_by_user_id") @db.Uuid /// → identity.users (logical)
+  createdAt       DateTime          @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime          @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([organizationId, resourceType])
+  @@map("retention_policies")
+}
+
+// ---------------------------------------------------------------------------
+// Messaging infrastructure (identical in every service schema)
+// ---------------------------------------------------------------------------
+
+/// Transactional outbox. Domain events are inserted in the SAME transaction as the state change and
+/// published afterwards by this service's relay. The durable source of events (Redis never is).
+/// Not tenant-filtered: the relay processes all organizations.
+model OutboxEvent {
+  id             String    @id @default(uuid(7)) @db.Uuid /// event id, time-ordered
+  aggregateType  String    @map("aggregate_type") @db.VarChar(64)
+  aggregateId    String    @map("aggregate_id") @db.Uuid
+  eventType      String    @map("event_type") @db.VarChar(128) /// e.g. "<service>.<entity>.<past_tense_verb>"
+  eventVersion   Int       @default(1) @map("event_version") @db.SmallInt
+  organizationId String?   @map("organization_id") @db.Uuid /// routing only; null for global events
+  payload        Json      @db.JsonB
+  headers        Json      @default("{}") @db.JsonB /// correlation / trace ids
+  occurredAt     DateTime  @default(now()) @map("occurred_at") @db.Timestamptz(3)
+  publishedAt    DateTime? @map("published_at") @db.Timestamptz(3)
+  attempts       Int       @default(0)
+  lastError      String?   @map("last_error") @db.VarChar(2000)
+
+  @@index([occurredAt], map: "outbox_events_unpublished_idx", where: raw("published_at IS NULL"))
+  @@index([publishedAt], map: "outbox_events_published_idx", where: raw("published_at IS NOT NULL"))
+  @@map("outbox_events")
+}
+
+/// Idempotent-consumer log: one row per (event, handler) successfully processed.
+model ProcessedEvent {
+  eventId     String   @map("event_id") @db.Uuid
+  handler     String   @db.VarChar(128)
+  processedAt DateTime @default(now()) @map("processed_at") @db.Timestamptz(3)
+
+  @@id([eventId, handler])
+  @@index([processedAt])
+  @@map("processed_events")
+}

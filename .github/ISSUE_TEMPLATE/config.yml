@@ -1,0 +1,3 @@
+# Force structured issues. Security vulnerabilities go through GitHub private vulnerability reporting
+# (see SECURITY.md), never public issues. A contact link can be added once the repository URL is known.
+blank_issues_enabled: false
