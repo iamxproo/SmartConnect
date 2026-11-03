@@ -43,7 +43,7 @@ import {
 } from './access.js';
 import type { ConversationContextDto, ConversationMessageDto, ConversationMessageListDto } from './dto.js';
 
-interface RepliesPage {
+export interface RepliesPage {
   data: ConversationMessageDto[];
   nextCursor: string | null;
 }

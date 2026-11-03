@@ -19,7 +19,8 @@ test('registers through the UI, verifies by the emailed link, signs in and signs
   await page.getByLabel('Email').fill(email);
   await page.getByLabel('Password').fill(PASSWORD);
   await page.getByRole('button', { name: 'Sign in' }).click();
-  await expect(page.getByRole('heading', { name: "You're not part of a company yet" })).toBeVisible();
+  // Signed in, in no organization yet: self-service creation is on in this stack (ADR 0017), so home offers it.
+  await expect(page.getByRole('heading', { name: 'Create your organization' })).toBeVisible();
 
   await page.getByRole('button', { name: 'Account menu: Grace Hopper' }).click();
   await page.getByRole('menuitem', { name: 'Sign out' }).click();

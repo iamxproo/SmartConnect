@@ -22,17 +22,35 @@ export const Trim = () =>
 /** Same rule as the organizations_slug_format_chk constraint. */
 export const SLUG = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
+/**
+ * A new organization's handle: SLUG, and not shaped like an id. Web addresses take a handle or an id
+ * (/o/{handleOrId}), so a handle must never read as another organization's id.
+ */
+export const ORGANIZATION_SLUG = new RegExp(
+  `^(?![0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$)${SLUG.source.slice(1)}`,
+);
+
+/**
+ * An organization's display name: at least one letter or digit, and no control or text-direction override characters
+ * (which could make a name in an invitation or a list read as something else).
+ */
+export const ORGANIZATION_NAME = /^(?=.*[\p{L}\p{N}])[^\p{Cc}\u202A-\u202E\u2066-\u2069]*$/u;
+const NAME_MESSAGE = 'name must contain a letter or digit, and no control or text-direction characters';
+
 export class CreateOrganizationDto {
   @ApiProperty({ maxLength: 120, example: 'Acme Corporation' })
   @Trim()
   @IsString()
   @MinLength(1)
   @MaxLength(120)
+  @Matches(ORGANIZATION_NAME, { message: NAME_MESSAGE })
   name!: string;
 
-  @ApiProperty({ pattern: SLUG.source, example: 'acme' })
+  @ApiProperty({ pattern: ORGANIZATION_SLUG.source, example: 'acme' })
   @IsString()
-  @Matches(SLUG, { message: 'slug must be 1-63 lowercase letters, digits or inner hyphens' })
+  @Matches(ORGANIZATION_SLUG, {
+    message: 'slug must be 1-63 lowercase letters, digits or inner hyphens, and not shaped like an id',
+  })
   slug!: string;
 
   @ApiPropertyOptional({ maxLength: 1000 })
@@ -59,6 +77,7 @@ export class UpdateOrganizationDto {
   @IsString()
   @MinLength(1)
   @MaxLength(120)
+  @Matches(ORGANIZATION_NAME, { message: NAME_MESSAGE })
   name?: string;
 
   @ApiPropertyOptional({ type: String, nullable: true, maxLength: 1000 })

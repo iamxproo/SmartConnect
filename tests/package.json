@@ -9,7 +9,7 @@
   },
   "scripts": {
     "test:unit": "vitest run --config vitest.unit.config.ts",
-    "pretest:db": "npm run build --workspace @smartconnect/backend-kit",
+    "pretest:db": "npm run build --workspace @smartconnect/backend-kit && npm run build --workspace @smartconnect/backend",
     "test:db": "vitest run --config vitest.database.config.ts",
     "test:e2e": "playwright test --config e2e/playwright.config.ts",
     "pretypecheck": "npm run build --workspace @smartconnect/backend-kit",

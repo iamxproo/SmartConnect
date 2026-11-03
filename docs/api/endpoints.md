@@ -44,7 +44,7 @@ Decisions: [ADR 0015](../decisions/0015-platform-administration.md) (Proposed). 
 | `GET /admin/accounts/summary` | → `{ total, verified, active, suspended, deactivated, superAdmins }` (deleted accounts not counted) |
 | `GET /admin/organizations?limit&cursor` | → `{ data: [{ id, slug, name, status, memberCount, createdAt }], total, nextCursor }`, newest first. Directory fields only |
 
-A Super Admin is not a member of any organization: `/orgs/{orgId}/…` answers 404 as for anyone else, and creating organizations still needs the allowlist.
+A Super Admin is not a member of any organization: `/orgs/{orgId}/…` answers 404 as for anyone else, and a Super Admin never creates organizations (ADR 0015, kept by ADR 0017).
 
 ## Organizations (`/orgs`)
 
@@ -62,7 +62,8 @@ Permissions (catalogue):
 | Method & path | Who | Body → response |
 |---|---|---|
 | `GET /orgs` | any | → `{ data: [{ id, slug, name, role: { key, name } }] }` (the caller's organizations) |
-| `POST /orgs` | allowlisted, verified email | `{ name, slug, description? }` → `201 Organization`; caller becomes `owner`. `403 organization_creation_not_allowed`, `409 slug_taken` |
+| `GET /orgs/creation-eligibility` | any | → `{ allowed, reason: null \| not_allowed \| email_not_verified \| limit_reached }`: whether `POST /orgs` would be allowed now |
+| `POST /orgs` | per `ORGANIZATION_CREATION` (ADR 0017): `open` = any verified account, up to `ORGANIZATION_MAX_OWNED_PER_USER` owned (allowlisted creators exempt); `allowlist` = listed, verified emails. Never a Super Admin | `{ name, slug, description? }` → `201 Organization`; caller becomes `owner`. The same request again (same handle and name, created and still owned by the caller) → `200` with that organization. `name` needs a letter or digit and no control or text-direction characters; `slug` may not be shaped like an id. `403 organization_creation_not_allowed`, `403 email_not_verified`, `403 organization_limit_reached`, `409 slug_taken`, `429` (10 per hour per person, 20 per client address) |
 | `GET /orgs/{orgId}` | member | → `Organization` |
 | `PATCH /orgs/{orgId}` | `organization.update` | `{ name?, description?, settings?: { invitationExpiryDays (1–30) } }` → `Organization` |
 | `GET /orgs/{orgId}/me` | member | → `Membership` |
@@ -73,13 +74,13 @@ Permissions (catalogue):
 
 ### Invitations
 
-`Invitation`: `{ id, email, role: { id, key, name }, status: pending|accepted|revoked|expired, expiresAt, createdAt }`
+`Invitation`: `{ id, email, role: { id, key, name }, status: pending|accepted|revoked|expired, expiresAt, acceptedAt, createdAt, delivery }`. `delivery` is where the latest email stands: `queued`, `sent`, `failed`, `disabled` (delivery turned off) or `unknown` (the server restarted, or another instance sent it). A `failed` invitation is still valid: resend it.
 
 | Method & path | Who | Body → response |
 |---|---|---|
-| `POST /orgs/{orgId}/invitations` | `members.invite` | `{ email, roleId }` → `201 Invitation` (email sent). `409 invitation_pending`, `409 already_member` |
-| `GET /orgs/{orgId}/invitations?status&limit&cursor` | `members.invite` | → list of `Invitation` |
-| `POST /orgs/{orgId}/invitations/{id}/resend` | `members.invite` | → `Invitation` (new token and expiry; the old link stops working) |
+| `POST /orgs/{orgId}/invitations` | `members.invite` | `{ email, roleId }` → `201 Invitation` (`delivery` says whether the email went out). `409 invitation_pending`, `409 already_member`, `403 owner_required` (only owners invite owners) |
+| `GET /orgs/{orgId}/invitations?status&limit&cursor` | `members.invite` | → list of `Invitation`, newest first. `status`: `pending` (default), `accepted`, `revoked`, `expired` or `all` |
+| `POST /orgs/{orgId}/invitations/{id}/resend` | `members.invite` | → `Invitation` (new token and expiry; the old link stops working). Pending or expired invitations; an expired one is renewed unless a newer one is pending (`409 invitation_pending`) or the person has joined (`409 already_member`). `409 invitation_not_pending` for accepted or revoked |
 | `DELETE /orgs/{orgId}/invitations/{id}` | `members.invite` | → 204 (revoked) |
 | `POST /invitations/preview` (public) | token holder | `{ token }` → `{ organization: { name, slug }, role: { name }, emailHint, expiresAt }`. `404 invitation_invalid` |
 | `POST /invitations/accept` | the invited person | `{ token }` → `{ organizationId, membership: Membership }`. `404 invitation_invalid`, `403 email_not_verified`, `403 invitation_email_mismatch`, `409 already_member` |
@@ -246,14 +247,15 @@ Decisions: [ADR 0013](../decisions/0013-collaboration-platform-expansion.md) (Pr
 
 | Method & path | Who | Body → response |
 |---|---|---|
-| `POST …/files` | member | `{ name (1–1024), sizeBytes (1–max) }` → `201 File` (`pending_upload`). `422` for a bad name or a size above the maximum (default 25 MiB) |
-| `PUT …/files/{id}/content` | uploader, once | Raw bytes, `Content-Type: application/octet-stream`, `Content-Length` required at the gateway → `200 File` (`available`). `413` more than declared or above the maximum, `422 size_mismatch` fewer than declared (the file stays `pending_upload`, retry), `409 already_uploaded`, `415` |
+| `POST …/files` | member | `{ name (1–1024), sizeBytes (1–max) }` → `201 File` (`pending_upload`). `422` for a bad name or a size above the maximum (default 25 MiB), `507 storage_quota_exceeded` if it would pass the storage budget, `503 storage_unavailable` while the stored total cannot be counted |
+| `PUT …/files/{id}/content` | uploader, once | Raw bytes, `Content-Type: application/octet-stream`, `Content-Length` required at the gateway → `200 File` (`available`). `413` more than declared or above the maximum, `422 size_mismatch` fewer than declared (the file stays `pending_upload`, retry), `409 already_uploaded`, `415`, `507 storage_quota_exceeded`, `503 storage_unavailable` (with `Retry-After`; the file is retired, never left half-made) |
 | `GET …/files?limit&cursor` | member | → list of my `available` files, newest first |
 | `GET …/files/{id}` | reader | → `File` |
 | `GET …/files/{id}/content` | reader | → the bytes. `Content-Type` (detected), `Content-Length`, `X-Content-Type-Options: nosniff`, `Content-Security-Policy: default-src 'none'; sandbox`, `Cache-Control: private, no-store`, `Content-Disposition: inline` for PNG/JPEG/GIF/WebP only and `attachment` (RFC 5987 `filename*`) otherwise |
+| `GET …/files/{id}/download-url` | reader | → `{ url, expiresAt }`: a presigned link to the bytes in object storage (Cloudflare R2), valid `FILES_SIGNED_URL_TTL_SECONDS` (default 60), for that one object with the same type and disposition as `…/content`. `Cache-Control: private, no-store`, `Referrer-Policy: no-referrer`. `404 signed_urls_unavailable` when the server stores files locally. Optional: the web app keeps using `…/content` |
 | `DELETE …/files/{id}` | uploader | → 204. The bytes are removed and the file is unreadable for everyone |
 
-Gateway limits: uploads are rate-limited per user (100 per hour) and capped at `FILES_MAX_BYTES`.
+Gateway limits: uploads are rate-limited per user (100 per hour) and capped at `FILES_MAX_BYTES`. A storage outage answers `503 storage_unavailable` on uploads and downloads.
 
 
 ## Realtime (`realtime-gateway`, Socket.IO; [ADR 0004](../decisions/0004-realtime-gateway.md))

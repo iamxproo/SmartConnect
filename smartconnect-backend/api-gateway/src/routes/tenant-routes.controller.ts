@@ -14,6 +14,12 @@ const MINUTE = 60;
 const HOUR = 60 * MINUTE;
 
 export const TENANT_RATE_LIMITS = {
+  // Self-service organization creation (ADR 0017): per person and per client address, on top of the service's cap on
+  // owned organizations.
+  organizationCreate: [
+    { name: 'organization-create-user', key: 'user', limit: 10, windowSeconds: HOUR },
+    { name: 'organization-create-ip', key: 'ip', limit: 20, windowSeconds: HOUR },
+  ],
   invitationPreview: [{ name: 'invitation-preview-ip', key: 'ip', limit: 30, windowSeconds: 10 * MINUTE }],
   invitationAccept: [{ name: 'invitation-accept-user', key: 'user', limit: 10, windowSeconds: 15 * MINUTE }],
   invitationCreate: [{ name: 'invitation-create-user', key: 'user', limit: 50, windowSeconds: HOUR }],
@@ -156,6 +162,17 @@ export class OrganizationRoutesController {
   @ApiResponse({ status: 200, description: 'Membership created' })
   @ApiProblemResponses(401, 403, 404, 409, 422, 429)
   accept(@Req() req: Request, @Res() res: Response): Promise<void> {
+    return this.proxy.forward('organization', req, res);
+  }
+
+  @Post('orgs')
+  @RateLimit(...TENANT_RATE_LIMITS.organizationCreate)
+  @ApiBearerAuth(BEARER_AUTH)
+  @ApiOperation({ summary: 'Create an organization; the caller becomes its owner' })
+  @ApiResponse({ status: 201, description: 'Organization created' })
+  @ApiResponse({ status: 200, description: 'The same request again: the organization it created' })
+  @ApiProblemResponses(401, 403, 409, 422, 429)
+  createOrganization(@Req() req: Request, @Res() res: Response): Promise<void> {
     return this.proxy.forward('organization', req, res);
   }
 

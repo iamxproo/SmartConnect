@@ -59,10 +59,17 @@ To run the apps locally:
 - `make web-dev` (web app, http://127.0.0.1:5173);
 - `make auth-dev-keys` once (a local signing key pair in the gitignored `.secrets/auth/`);
 - `make identity-start` (identity service on the dev database, http://127.0.0.1:3101);
-- `make organization-start` (:3102). Only listed, **verified** emails may create organizations: run `make organization-creators` once in your own terminal. It stores the list in the gitignored `.secrets/organization.env`, which survives `make db-bootstrap`;
+- `make organization-start` (:3102). Locally, by default, only listed, **verified** emails may create organizations (`ORGANIZATION_CREATION=allowlist`): run `make organization-creators` once in your own terminal. To try self-service onboarding, where any verified account creates its own organization (ADR 0017), start with `ORGANIZATION_CREATION=open` in the environment. It stores the list in the gitignored `.secrets/organization.env`, which survives `make db-bootstrap`;
 - `make workspace-start` (:3103) and `make messaging-start` (:3104);
 - `make realtime-start` (Socket.IO, :3105). It needs `REDIS_URL`: see [its README](../smartconnect-backend/realtime-gateway/README.md). Give the messaging service the same `REDIS_URL`;
 - `make gateway-start` (API gateway, http://127.0.0.1:3000; `curl http://127.0.0.1:3000/health/ready`).
+
+**Or, in one command, the unified backend** ([ADR 0016](decisions/0016-unified-backend.md), Phase 1): `make backend-start` starts all seven applications in one process.
+- The public URL is http://127.0.0.1:3000, serving REST and `/realtime/socket.io`.
+- The internal applications keep their ports above, on loopback only, so the dev mailboxes are still at :3101 and :3102.
+- It reads `REDIS_URL` from the root `.env` and each service's database URL from its generated `.env`. See [its README](../smartconnect-backend/app/README.md).
+- Use it **instead of** the per-service targets, not alongside them: it checks its ports first and refuses to start if any is busy.
+- `make e2e-unified` runs the browser suite against it.
 
 By default, local emails are not sent. Read them with `curl 'http://127.0.0.1:3101/dev/mailbox?to=you@example.com'` (verification and password reset), or on :3102 for invitations.
 

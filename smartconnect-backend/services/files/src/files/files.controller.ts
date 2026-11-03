@@ -23,10 +23,8 @@ import { pageOf } from '../common/pagination.js';
 import { UuidParam } from '../common/uuid-param.js';
 import { CurrentOrg } from '../org/org-membership.guard.js';
 import type { OrgMembership } from '../org/organization-directory.js';
-import { INLINE_TYPES } from './content-type.js';
-import { CreateFileDto, FileDto, FileListDto, ListFilesQueryDto } from './dto.js';
-import { FilesService } from './files.service.js';
-import { contentDisposition } from './names.js';
+import { CreateFileDto, FileDto, FileListDto, ListFilesQueryDto, SignedDownloadDto } from './dto.js';
+import { FilesService, servedDisposition, servedType } from './files.service.js';
 
 const actorOf = (org: OrgMembership, principal: Principal) => ({
   organizationId: org.organizationId,
@@ -114,16 +112,34 @@ export class FilesController {
   ): Promise<void> {
     const { file, stream } = await this.files.download(actorOf(org, principal), fileId, req);
     res.status(200);
-    res.setHeader('Content-Type', file.mimeType === 'text/plain' ? 'text/plain; charset=utf-8' : file.mimeType);
+    res.setHeader('Content-Type', servedType(file));
     res.setHeader('Content-Length', String(file.sizeBytes));
-    res.setHeader(
-      'Content-Disposition',
-      contentDisposition(INLINE_TYPES.has(file.mimeType) ? 'inline' : 'attachment', file.name),
-    );
+    res.setHeader('Content-Disposition', servedDisposition(file));
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Content-Security-Policy', "default-src 'none'; sandbox");
     res.setHeader('Cache-Control', 'private, no-store');
     pipeline(stream, res, () => undefined); // a failure mid-stream destroys the response; the client sees a short body
+  }
+
+  @Get(':fileId/download-url')
+  @ApiOperation({
+    summary:
+      'A short-lived signed link to the bytes in object storage (same access as …/content); 404 signed_urls_unavailable without object storage',
+  })
+  @ApiOkResponse({ type: SignedDownloadDto })
+  @ApiProblemResponses(401, 404, 503)
+  async downloadUrl(
+    @CurrentOrg() org: OrgMembership,
+    @CurrentPrincipal() principal: Principal,
+    @Param('fileId', UuidParam()) fileId: string,
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<SignedDownloadDto> {
+    const link = await this.files.downloadUrl(actorOf(org, principal), fileId, req);
+    // The link is a capability: never cached, never sent on as a referrer.
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    return link;
   }
 
   @Delete(':fileId')

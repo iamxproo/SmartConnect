@@ -1,6 +1,7 @@
-// Invitation lifecycle (ADR 0010): only holders of members.invite create, list, resend and revoke; tokens are 256-bit,
-// stored as SHA-256, single-use and expiring; acceptance requires the caller's VERIFIED account email to equal the
-// invited address, and creates the membership in the same transaction that consumes the invitation.
+// Invitation lifecycle (ADR 0010, ADR 0017): only holders of members.invite create, list, resend and revoke; tokens are
+// 256-bit, stored as SHA-256, single-use and expiring; acceptance requires the caller's VERIFIED account email to equal
+// the invited address, and creates the membership in the same transaction that consumes the invitation. Every answer
+// says where the invitation's latest email stands (`delivery`), so a failed email is resent, never silently left.
 import { createHash, randomBytes } from 'node:crypto';
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { ApiProblemException, type Principal } from '@smartconnect/backend-kit';
@@ -14,7 +15,14 @@ import { PRISMA, type OrganizationPrisma } from '../database/prisma.token.js';
 import { conflict, forbidden, invalidField, isUniqueViolation } from '../errors.js';
 import { recordEvents } from '../events/outbox.js';
 import { decodeCursor, encodeCursor } from '../ids.js';
-import { INVITATION_NOTIFIER, notifySafely, type InvitationNotifier } from '../notifications/invitation-notifier.js';
+import {
+  INVITATION_DELIVERIES,
+  INVITATION_NOTIFIER,
+  InvitationDeliveries,
+  notifySafely,
+  type InvitationDelivery,
+  type InvitationNotifier,
+} from '../notifications/invitation-notifier.js';
 import { settingsOf, toMembership } from '../organizations/organizations.service.js';
 import type { CreateInvitationDto, ListInvitationsQueryDto } from './dto.js';
 
@@ -39,19 +47,23 @@ const invitationSelect = {
   emailNormalized: true,
   status: true,
   expiresAt: true,
+  acceptedAt: true,
   createdAt: true,
+  tokenHash: true, // to match the delivery record to the current link; never in an answer
   role: { select: { id: true, key: true, name: true } },
 } as const;
 type InvitationRow = Prisma.OrganizationInvitationGetPayload<{ select: typeof invitationSelect }>;
 
 /** A pending invitation past its expiry is reported as expired (the row is marked lazily). */
-const toInvitation = (row: InvitationRow, now = new Date()) => ({
+const toInvitation = (row: InvitationRow, delivery: InvitationDelivery, now = new Date()) => ({
   id: row.id,
   email: row.emailNormalized,
   role: row.role,
   status: row.status === 'pending' && row.expiresAt <= now ? 'expired' : row.status,
   expiresAt: row.expiresAt.toISOString(),
+  acceptedAt: row.acceptedAt?.toISOString() ?? null,
   createdAt: row.createdAt.toISOString(),
+  delivery,
 });
 
 @Injectable()
@@ -63,6 +75,7 @@ export class InvitationsService {
     @Inject(ORGANIZATION_CONFIG) private readonly config: OrganizationConfig,
     @Inject(IdentityClient) private readonly identity: IdentityClient,
     @Inject(INVITATION_NOTIFIER) private readonly notifier: InvitationNotifier,
+    @Inject(INVITATION_DELIVERIES) private readonly deliveries: InvitationDeliveries,
   ) {}
 
   async create(membership: Membership, input: CreateInvitationDto) {
@@ -118,8 +131,7 @@ export class InvitationsService {
       }
       throw error;
     }
-    await this.send(token, created.invitation, created);
-    return toInvitation(created.invitation);
+    return toInvitation(created.invitation, await this.send(token, created.invitation, created));
   }
 
   async list(membership: Membership, query: ListInvitationsQueryDto) {
@@ -129,11 +141,13 @@ export class InvitationsService {
     const now = new Date();
     const status = query.status ?? 'pending';
     const statusFilter: Prisma.OrganizationInvitationWhereInput =
-      status === 'pending'
-        ? { status: 'pending', expiresAt: { gt: now } }
-        : status === 'expired'
-          ? { OR: [{ status: 'expired' }, { status: 'pending', expiresAt: { lte: now } }] }
-          : { status };
+      status === 'all'
+        ? {}
+        : status === 'pending'
+          ? { status: 'pending', expiresAt: { gt: now } }
+          : status === 'expired'
+            ? { OR: [{ status: 'expired' }, { status: 'pending', expiresAt: { lte: now } }] }
+            : { status };
     const rows = await withTenant(this.prisma, this.context(membership), (tx) =>
       tx.organizationInvitation.findMany({
         where: { ...statusFilter, ...(beforeId ? { id: { lt: beforeId } } : {}) },
@@ -144,42 +158,65 @@ export class InvitationsService {
     );
     const page = rows.slice(0, limit);
     return {
-      data: page.map((row) => toInvitation(row, now)),
+      data: page.map((row) => toInvitation(row, this.deliveries.of(row.id, row.tokenHash), now)),
       nextCursor: rows.length > limit ? encodeCursor(page[page.length - 1]!.id) : null,
     };
   }
 
-  /** New token and expiry for a still-pending invitation; the previous link stops working. */
+  /**
+   * New token and expiry for a pending or expired invitation; the previous link stops working. An expired one is
+   * renewed only if nobody else holds that address's pending invitation and the person has not joined meanwhile.
+   */
   async resend(membership: Membership, invitationId: string) {
     const token = randomBytes(32).toString('base64url');
-    const result = await withTenant(this.prisma, this.context(membership), async (tx) => {
-      const current = await tx.organizationInvitation.findFirst({
-        where: { id: invitationId },
-        select: { status: true, role: { select: { key: true, name: true } } },
+    let result;
+    try {
+      result = await withTenant(this.prisma, this.context(membership), async (tx) => {
+        const current = await tx.organizationInvitation.findFirst({
+          where: { id: invitationId },
+          select: { status: true, emailNormalized: true, role: { select: { key: true, name: true } } },
+        });
+        if (!current) throw notFound();
+        if (current.status !== 'pending' && current.status !== 'expired')
+          throw conflict('invitation_not_pending', 'Only pending or expired invitations can be resent.');
+        if (current.role.key === OWNER_ROLE_KEY && !isOwner(membership)) {
+          throw forbidden('Only owners can invite owners.', 'owner_required');
+        }
+        if (
+          current.status === 'expired' &&
+          (await tx.organizationMember.findFirst({
+            where: { email: { equals: current.emailNormalized, mode: 'insensitive' } },
+            select: { id: true },
+          }))
+        ) {
+          throw conflict('already_member', 'This person is already a member of the organization.');
+        }
+        const org = await tx.organization.findFirstOrThrow({ select: { name: true, settings: true } });
+        const inviter = await tx.organizationMember.findFirstOrThrow({
+          where: { id: membership.memberId },
+          select: { displayName: true },
+        });
+        const invitation = await tx.organizationInvitation.update({
+          where: { id: invitationId },
+          data: {
+            status: 'pending',
+            tokenHash: sha256Hex(token),
+            expiresAt: new Date(Date.now() + settingsOf(org.settings).invitationExpiryDays * DAY_MS),
+          },
+          select: invitationSelect,
+        });
+        return { invitation, organizationName: org.name, roleName: current.role.name, invitedBy: inviter.displayName };
       });
-      if (!current) throw notFound();
-      if (current.status !== 'pending')
-        throw conflict('invitation_not_pending', 'Only pending invitations can be resent.');
-      if (current.role.key === OWNER_ROLE_KEY && !isOwner(membership)) {
-        throw forbidden('Only owners can invite owners.', 'owner_required');
+    } catch (error) {
+      if (isUniqueViolation(error)) {
+        throw conflict(
+          'invitation_pending',
+          'A newer invitation is pending for this address. Resend that one instead.',
+        );
       }
-      const org = await tx.organization.findFirstOrThrow({ select: { name: true, settings: true } });
-      const inviter = await tx.organizationMember.findFirstOrThrow({
-        where: { id: membership.memberId },
-        select: { displayName: true },
-      });
-      const invitation = await tx.organizationInvitation.update({
-        where: { id: invitationId },
-        data: {
-          tokenHash: sha256Hex(token),
-          expiresAt: new Date(Date.now() + settingsOf(org.settings).invitationExpiryDays * DAY_MS),
-        },
-        select: invitationSelect,
-      });
-      return { invitation, organizationName: org.name, roleName: current.role.name, invitedBy: inviter.displayName };
-    });
-    await this.send(token, result.invitation, result);
-    return toInvitation(result.invitation);
+      throw error;
+    }
+    return toInvitation(result.invitation, await this.send(token, result.invitation, result));
   }
 
   /** Idempotent for already-revoked invitations; accepted ones cannot be revoked (remove the member instead). */
@@ -338,21 +375,32 @@ export class InvitationsService {
     return { organizationId: row.organization_id, invitationId: row.invitation_id };
   }
 
+  /** Emails the invitation's current link and returns where that email stands (a queued one settles later). */
   private async send(
     token: string,
     invitation: InvitationRow,
     details: { organizationName: string; roleName: string; invitedBy: string | null },
-  ) {
-    await notifySafely(this.notifier, this.logger, {
-      kind: 'organization_invitation',
-      to: invitation.emailNormalized,
-      token,
-      link: `${this.config.webAppUrl}/invitations/accept#token=${token}`,
-      organizationName: details.organizationName,
-      roleName: details.roleName,
-      invitedBy: details.invitedBy,
-      expiresAt: invitation.expiresAt,
-    });
+  ): Promise<InvitationDelivery> {
+    const { id, tokenHash } = invitation;
+    this.deliveries.record(id, tokenHash, 'queued');
+    const delivery = await notifySafely(
+      this.notifier,
+      this.logger,
+      {
+        kind: 'organization_invitation',
+        to: invitation.emailNormalized,
+        token,
+        link: `${this.config.webAppUrl}/invitations/accept#token=${token}`,
+        organizationName: details.organizationName,
+        roleName: details.roleName,
+        invitedBy: details.invitedBy,
+        expiresAt: invitation.expiresAt,
+      },
+      (outcome) => this.deliveries.settle(id, tokenHash, outcome),
+    );
+    // A background notifier may already have settled while `send` ran; only the other outcomes are final here.
+    if (delivery !== 'queued') this.deliveries.record(id, tokenHash, delivery);
+    return this.deliveries.of(id, tokenHash);
   }
 
   private context(membership: Membership) {

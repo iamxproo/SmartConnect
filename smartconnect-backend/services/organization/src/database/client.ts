@@ -75,3 +75,32 @@ export async function withUser<T>(
     { timeout: timeoutMs },
   );
 }
+
+/**
+ * Creating an organization: one transaction in two phases. `decide` runs first with the user context only, so only the
+ * user-scoped read policies apply (exactly as in withUser: the caller's own memberships and organizations, nothing
+ * tenant-scoped); `create` then runs in the new organization's tenant context (exactly as in withTenant), which is the
+ * only place it can write. Being one transaction lets an advisory lock taken in `decide` cover both, so a decision
+ * from the caller's other organizations (a cap, a repeated request) still holds when the new one is written.
+ */
+export async function withUserThenNewTenant<D, T>(
+  prisma: PrismaClient,
+  context: { userId: string; organizationId: string },
+  decide: (tx: Prisma.TransactionClient) => Promise<D>,
+  create: (tx: Prisma.TransactionClient, decided: D) => Promise<T>,
+  { timeoutMs = 10_000 }: { timeoutMs?: number } = {},
+): Promise<T> {
+  if (!UUID.test(context.userId) || !UUID.test(context.organizationId)) {
+    throw new Error('withUserThenNewTenant: userId and organizationId must be UUIDs');
+  }
+  return prisma.$transaction(
+    async (tx) => {
+      await tx.$executeRaw`SELECT set_config('app.current_organization_id', '', true),
+                                set_config('app.current_user_id', ${context.userId}, true)`;
+      const decided = await decide(tx);
+      await tx.$executeRaw`SELECT set_config('app.current_organization_id', ${context.organizationId}, true)`;
+      return create(tx, decided);
+    },
+    { timeout: timeoutMs },
+  );
+}

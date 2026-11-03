@@ -56,3 +56,9 @@ export class ListFilesQueryDto extends PageQueryDto {
   @MaxLength(100)
   q?: string;
 }
+
+export class SignedDownloadDto {
+  @ApiProperty({ description: 'Presigned link to the bytes; anyone holding it can read the file until it expires' })
+  url!: string;
+  @ApiProperty({ format: 'date-time' }) expiresAt!: string;
+}

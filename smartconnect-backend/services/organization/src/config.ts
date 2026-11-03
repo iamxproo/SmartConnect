@@ -25,6 +25,10 @@ export { ConfigError };
 export const invitationNotifiers = ['dev-mailbox', 'smtp', 'disabled'] as const;
 export type InvitationNotifierKind = (typeof invitationNotifiers)[number];
 
+/** Who may create organizations (ADR 0017): any verified account, or only the allowlist. */
+export const organizationCreationModes = ['open', 'allowlist'] as const;
+export type OrganizationCreationMode = (typeof organizationCreationModes)[number];
+
 export interface OrganizationConfig {
   env: Environment;
   host: string;
@@ -39,10 +43,17 @@ export interface OrganizationConfig {
   identityServiceUrl: string;
   webAppUrl: string;
   /**
-   * Verified email addresses allowed to create organizations. Companies are set up by authorized administrators,
-   * never self-service (no personal workspaces). Empty = nobody can create one (fail closed).
+   * "open": any active account with a verified email creates organizations (self-service), up to
+   * `maxOwnedOrganizations` each. "allowlist": only `organizationCreatorEmails`. Platform Super Admins never do.
+   */
+  organizationCreation: OrganizationCreationMode;
+  /**
+   * Verified email addresses allowed to create organizations: the only creators in "allowlist" mode (empty = nobody,
+   * fail closed); exempt from `maxOwnedOrganizations` in "open" mode.
    */
   organizationCreatorEmails: ReadonlySet<string>;
+  /** "open" mode: organizations one person may own; a further one is refused (organization_limit_reached). */
+  maxOwnedOrganizations: number;
   invitationNotifier: InvitationNotifierKind;
   /** Present when `invitationNotifier` is "smtp". */
   smtp?: SmtpConfig;
@@ -97,6 +108,27 @@ export function loadConfig(env: Env = process.env): OrganizationConfig {
       problems.push('ORGANIZATION_CREATOR_EMAILS must be a comma-separated list of email addresses');
   }
 
+  // Outside production the default stays the allowlist (local stacks and tests opt in to self-service); production
+  // must choose explicitly, as for INVITATION_NOTIFIER.
+  let organizationCreation: OrganizationCreationMode = 'allowlist';
+  if (env.ORGANIZATION_CREATION === undefined) {
+    if (isProduction)
+      problems.push(
+        'ORGANIZATION_CREATION is required in production ("open": any verified account; "allowlist": ORGANIZATION_CREATOR_EMAILS only)',
+      );
+  } else if (!(organizationCreationModes as readonly string[]).includes(env.ORGANIZATION_CREATION)) {
+    problems.push(`ORGANIZATION_CREATION must be one of ${organizationCreationModes.join(', ')}`);
+  } else {
+    organizationCreation = env.ORGANIZATION_CREATION as OrganizationCreationMode;
+  }
+  const maxOwnedOrganizations = parseInteger(
+    'ORGANIZATION_MAX_OWNED_PER_USER',
+    env.ORGANIZATION_MAX_OWNED_PER_USER ?? '10',
+    1,
+    1000,
+    problems,
+  );
+
   let invitationNotifier: InvitationNotifierKind = 'dev-mailbox';
   if (env.INVITATION_NOTIFIER === undefined) {
     if (isProduction)
@@ -131,7 +163,9 @@ export function loadConfig(env: Env = process.env): OrganizationConfig {
     },
     identityServiceUrl,
     webAppUrl,
+    organizationCreation,
     organizationCreatorEmails: new Set(creators),
+    maxOwnedOrganizations,
     invitationNotifier,
     ...(smtp && { smtp }),
   };

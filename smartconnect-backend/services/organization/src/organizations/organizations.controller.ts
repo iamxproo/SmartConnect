@@ -11,11 +11,12 @@ import {
   Post,
   Query,
   Req,
+  Res,
   UseGuards,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { ApiProblemResponses, BEARER_AUTH, CurrentPrincipal, type Principal } from '@smartconnect/backend-kit';
-import type { Request } from 'express';
+import type { Request, Response } from 'express';
 import {
   CurrentMembership,
   notFound,
@@ -42,10 +43,27 @@ export class OrganizationsController {
   }
 
   @Post()
-  @ApiOperation({ summary: 'Create an organization (authorized administrators with a verified email only)' })
+  @ApiOperation({
+    summary:
+      'Create an organization; the caller becomes its owner (201). Repeating the same request returns that organization (200)',
+  })
   @ApiProblemResponses(403, 409, 422)
-  create(@Req() req: Request, @CurrentPrincipal() principal: Principal, @Body() dto: CreateOrganizationDto) {
-    return this.organizations.create(req, principal, dto);
+  async create(
+    @Req() req: Request,
+    @CurrentPrincipal() principal: Principal,
+    @Body() dto: CreateOrganizationDto,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const { organization, created } = await this.organizations.create(req, principal, dto);
+    res.status(created ? 201 : 200);
+    return organization;
+  }
+
+  // Before ':orgId'.
+  @Get('creation-eligibility')
+  @ApiOperation({ summary: 'Whether the caller may create an organization now, and if not, why' })
+  creationEligibility(@Req() req: Request, @CurrentPrincipal() principal: Principal) {
+    return this.organizations.creationEligibility(req, principal);
   }
 
   @Get(':orgId')

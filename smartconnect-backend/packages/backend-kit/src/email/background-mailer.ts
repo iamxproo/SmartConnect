@@ -26,9 +26,13 @@ export interface BackgroundMailerOptions {
 
 const CONTEXT = 'BackgroundMailer';
 
+/** The final outcome of one queued message: sent, or given up on (attempts exhausted, permanent failure, queue full). */
+export type MailOutcome = 'sent' | 'failed';
+
 interface Job {
   kind: string;
   message: EmailMessage;
+  onSettled?: (outcome: MailOutcome) => void;
 }
 
 export class BackgroundMailer {
@@ -53,13 +57,17 @@ export class BackgroundMailer {
     this.maxQueue = options.maxQueue ?? 1000;
   }
 
-  /** Never throws and never waits for delivery. A full queue drops the message and says so. */
-  enqueue(kind: string, message: EmailMessage): void {
+  /**
+   * Never throws and never waits for delivery. A full queue drops the message and says so. `onSettled`, if given, is
+   * told the final outcome once (a callback that throws is ignored: it must not stop the queue).
+   */
+  enqueue(kind: string, message: EmailMessage, onSettled?: (outcome: MailOutcome) => void): void {
     if (this.queue.length >= this.maxQueue) {
       this.logger.error({ event: 'email_queue_full', kind }, CONTEXT);
+      settle(onSettled, 'failed');
       return;
     }
-    this.queue.push({ kind, message });
+    this.queue.push({ kind, message, onSettled });
     this.pump();
   }
 
@@ -102,11 +110,12 @@ export class BackgroundMailer {
     }
   }
 
-  private async run({ kind, message }: Job): Promise<void> {
+  private async run({ kind, message, onSettled }: Job): Promise<void> {
     for (let attempt = 1; ; attempt++) {
       try {
         await this.transport.send(message);
         this.logger.log({ event: 'email_sent', kind, attempts: attempt }, CONTEXT);
+        settle(onSettled, 'sent');
         return;
       } catch (error) {
         const known = error instanceof EmailDeliveryError ? error : undefined;
@@ -125,6 +134,7 @@ export class BackgroundMailer {
           },
           CONTEXT,
         );
+        settle(onSettled, 'failed');
         return;
       }
     }
@@ -139,3 +149,11 @@ export class BackgroundMailer {
 }
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+function settle(onSettled: ((outcome: MailOutcome) => void) | undefined, outcome: MailOutcome): void {
+  try {
+    onSettled?.(outcome);
+  } catch {
+    // The caller's bookkeeping; never the queue's problem.
+  }
+}

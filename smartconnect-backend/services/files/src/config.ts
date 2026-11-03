@@ -1,5 +1,7 @@
 // Files service configuration from environment variables, validated once at startup (fail fast, all problems at
-// once, values never echoed). Secrets: DATABASE_URL (runtime role sc_files_app).
+// once, values never echoed). Secrets: DATABASE_URL (runtime role sc_files_app) and, with the R2 driver,
+// FILES_R2_SECRET_ACCESS_KEY.
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -29,6 +31,24 @@ export const MAX_FILES_MAX_BYTES = 100 * MIB;
 
 export const PENDING_UPLOAD_TTL_MS = 24 * 60 * 60 * 1000;
 
+export const storageProviders = ['local', 'r2'] as const;
+export type StorageProvider = (typeof storageProviders)[number];
+/** Cloudflare R2's free storage, 10 GB, in decimal bytes: the smaller reading of "GB", so the safe one. */
+export const DEFAULT_STORAGE_BUDGET_BYTES = 10_000_000_000;
+const R2_HOST = /^[a-z0-9-]+(\.[a-z0-9-]+)*\.r2\.cloudflarestorage\.com$/;
+const LOOPBACK = new Set(['127.0.0.1', 'localhost', '[::1]']);
+
+export interface R2StorageConfig {
+  provider: 'r2';
+  /** https://<account id>.r2.cloudflarestorage.com */
+  endpoint: URL;
+  bucket: string;
+  region: string;
+  accessKeyId: string;
+  secretAccessKey: string;
+  timeoutMs: number;
+}
+
 /** <repo>/.local/files, relative to this module (src/ and dist/ sit at the same depth). Development and test only. */
 const DEV_STORAGE_DIR = fileURLToPath(new URL('../../../../.local/files', import.meta.url));
 
@@ -52,8 +72,18 @@ export interface FilesConfig {
   organizationServiceUrl: string;
   /** Owns message attachments; asked (as the caller) whether a non-uploader may read a file. */
   messagingServiceUrl: string;
+  /** Where the bytes live: the local-filesystem driver, or Cloudflare R2. */
+  storage: { provider: 'local' } | R2StorageConfig;
   /** Absolute directory of the local-filesystem storage driver. Never served. */
   storageDir: string;
+  /** Where the R2 driver stages uploads before sending them (the local driver stages inside storageDir). */
+  stagingDir: string;
+  /** Total bytes the application lets the storage hold (storage-budget.ts); not a provider billing cap. */
+  storageBudgetBytes: number;
+  /** How often the stored bytes are re-counted from the storage itself. */
+  storageUsageScanIntervalMs: number;
+  /** Lifetime of a presigned download link (R2 only). */
+  signedUrlTtlSeconds: number;
   /** Largest accepted file. */
   maxFileBytes: number;
   /** Declared-but-not-yet-uploaded files one user may hold; beyond it, create answers 409 too_many_pending_uploads. */
@@ -104,14 +134,57 @@ export function loadConfig(env: Env = process.env): FilesConfig {
   const organizationServiceUrl = serviceUrl('ORGANIZATION_SERVICE_URL', 'http://127.0.0.1:3102');
   const messagingServiceUrl = serviceUrl('MESSAGING_SERVICE_URL', 'http://127.0.0.1:3104');
 
-  let storageDir = DEV_STORAGE_DIR;
-  if (env.FILES_STORAGE_DIR === undefined || env.FILES_STORAGE_DIR.trim() === '') {
-    if (isProduction) problems.push('FILES_STORAGE_DIR is required in production');
-  } else if (!path.isAbsolute(env.FILES_STORAGE_DIR)) {
-    problems.push('FILES_STORAGE_DIR must be an absolute path');
+  // Production names its storage explicitly; elsewhere the local directory stays the default, and R2 needs nothing.
+  let provider: StorageProvider = 'local';
+  if (env.FILES_STORAGE_PROVIDER === undefined) {
+    if (isProduction)
+      problems.push(
+        'FILES_STORAGE_PROVIDER is required in production ("r2": Cloudflare R2; "local": FILES_STORAGE_DIR on this machine)',
+      );
+  } else if (!(storageProviders as readonly string[]).includes(env.FILES_STORAGE_PROVIDER)) {
+    problems.push(`FILES_STORAGE_PROVIDER must be one of ${storageProviders.join(', ')}`);
   } else {
-    storageDir = path.resolve(env.FILES_STORAGE_DIR);
+    provider = env.FILES_STORAGE_PROVIDER as StorageProvider;
   }
+
+  const absoluteDir = (name: string): string | undefined => {
+    const raw = env[name];
+    if (raw === undefined || raw.trim() === '') return undefined;
+    if (!path.isAbsolute(raw)) {
+      problems.push(`${name} must be an absolute path`);
+      return undefined;
+    }
+    return path.resolve(raw);
+  };
+  const configuredDir = absoluteDir('FILES_STORAGE_DIR');
+  if (configuredDir === undefined && isProduction && provider === 'local' && env.FILES_STORAGE_PROVIDER !== undefined)
+    problems.push('FILES_STORAGE_DIR is required in production with FILES_STORAGE_PROVIDER=local');
+  const storageDir = configuredDir ?? DEV_STORAGE_DIR;
+  const stagingDir = absoluteDir('FILES_STAGING_DIR') ?? path.join(tmpdir(), 'smartconnect-files-staging');
+
+  const storage = provider === 'r2' ? parseR2(env, problems, isProduction) : { provider: 'local' as const };
+
+  const storageBudgetBytes = parseInteger(
+    'FILES_STORAGE_BUDGET_BYTES',
+    env.FILES_STORAGE_BUDGET_BYTES ?? String(DEFAULT_STORAGE_BUDGET_BYTES),
+    MIB,
+    10_000_000_000_000,
+    problems,
+  );
+  const storageUsageScanSeconds = parseInteger(
+    'FILES_STORAGE_USAGE_SCAN_SECONDS',
+    env.FILES_STORAGE_USAGE_SCAN_SECONDS ?? '900',
+    60,
+    86_400,
+    problems,
+  );
+  const signedUrlTtlSeconds = parseInteger(
+    'FILES_SIGNED_URL_TTL_SECONDS',
+    env.FILES_SIGNED_URL_TTL_SECONDS ?? '60',
+    10,
+    600,
+    problems,
+  );
 
   const maxFileBytes = parseInteger(
     'FILES_MAX_BYTES',
@@ -152,10 +225,65 @@ export function loadConfig(env: Env = process.env): FilesConfig {
     audience: env.AUTH_JWT_AUDIENCE ?? DEFAULT_ACCESS_TOKEN_AUDIENCE,
     organizationServiceUrl,
     messagingServiceUrl,
+    storage: storage ?? { provider: 'local' },
     storageDir,
+    stagingDir,
+    storageBudgetBytes,
+    storageUsageScanIntervalMs: storageUsageScanSeconds * 1000,
+    signedUrlTtlSeconds,
     maxFileBytes,
     maxPendingUploadsPerUser,
     maxConcurrentUploadsPerUser,
     pendingUploadTtlMs: PENDING_UPLOAD_TTL_MS,
   };
+}
+
+/**
+ * The R2 driver's settings. The endpoint is the account's S3 endpoint and nothing else: https, no path, query or
+ * credentials, and in production a host under r2.cloudflarestorage.com, so a typo can never send files (and bills)
+ * to another provider. Outside production a loopback http endpoint is allowed for local fakes.
+ */
+function parseR2(env: Env, problems: string[], isProduction: boolean): R2StorageConfig | undefined {
+  const before = problems.length;
+  let endpoint: URL | undefined;
+  const raw = env.FILES_R2_ENDPOINT?.trim();
+  if (!raw) {
+    problems.push(
+      'FILES_R2_ENDPOINT is required with FILES_STORAGE_PROVIDER=r2 (https://<account id>.r2.cloudflarestorage.com)',
+    );
+  } else {
+    try {
+      endpoint = new URL(raw);
+    } catch {
+      problems.push('FILES_R2_ENDPOINT must be a URL');
+    }
+    if (endpoint) {
+      const loopbackFake = !isProduction && endpoint.protocol === 'http:' && LOOPBACK.has(endpoint.hostname);
+      if (endpoint.username || endpoint.password || endpoint.search || endpoint.hash || endpoint.pathname !== '/')
+        problems.push('FILES_R2_ENDPOINT must be the endpoint alone: no path, query or credentials');
+      else if (endpoint.protocol !== 'https:' && !loopbackFake) problems.push('FILES_R2_ENDPOINT must be https');
+      else if (isProduction && !R2_HOST.test(endpoint.hostname))
+        problems.push('FILES_R2_ENDPOINT must be a Cloudflare R2 endpoint (<account id>.r2.cloudflarestorage.com)');
+    }
+  }
+  const bucket = env.FILES_R2_BUCKET?.trim();
+  if (!bucket) problems.push('FILES_R2_BUCKET is required with FILES_STORAGE_PROVIDER=r2');
+  else if (!/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/.test(bucket))
+    problems.push('FILES_R2_BUCKET must be 3-63 lowercase letters, digits or hyphens');
+  const accessKeyId = env.FILES_R2_ACCESS_KEY_ID?.trim();
+  if (!accessKeyId) problems.push('FILES_R2_ACCESS_KEY_ID is required with FILES_STORAGE_PROVIDER=r2');
+  else if (!/^[A-Za-z0-9]{16,128}$/.test(accessKeyId))
+    problems.push('FILES_R2_ACCESS_KEY_ID must be 16-128 letters or digits');
+  const secretAccessKey = readSecret(env, 'FILES_R2_SECRET_ACCESS_KEY', problems)?.trim();
+  if (secretAccessKey === undefined && env.FILES_R2_SECRET_ACCESS_KEY_FILE === undefined)
+    problems.push(
+      'FILES_R2_SECRET_ACCESS_KEY (or FILES_R2_SECRET_ACCESS_KEY_FILE) is required with FILES_STORAGE_PROVIDER=r2',
+    );
+  else if (secretAccessKey !== undefined && !/^\S{16,256}$/.test(secretAccessKey))
+    problems.push('FILES_R2_SECRET_ACCESS_KEY must be 16-256 characters without spaces');
+  const region = env.FILES_R2_REGION?.trim() || 'auto';
+  if (!/^[a-z0-9-]{1,32}$/.test(region)) problems.push('FILES_R2_REGION must be lowercase letters, digits or hyphens');
+  const timeoutMs = parseInteger('FILES_R2_TIMEOUT_MS', env.FILES_R2_TIMEOUT_MS ?? '30000', 1000, 120_000, problems);
+  if (problems.length > before || !endpoint || !bucket || !accessKeyId || !secretAccessKey) return undefined;
+  return { provider: 'r2', endpoint, bucket, region, accessKeyId, secretAccessKey, timeoutMs };
 }

@@ -81,7 +81,7 @@ jobs:
       # Each backend workspace is targeted explicitly and WITHOUT --if-present: a service that lacks
       # a typecheck/build script fails the job instead of being silently skipped.
       - name: Type-check backend workspaces
-        run: for d in smartconnect-backend/packages/*/ smartconnect-backend/services/*/ smartconnect-backend/scripts/ smartconnect-backend/api-gateway/ smartconnect-backend/realtime-gateway/; do npm run typecheck --workspace "${d%/}"; done
+        run: for d in smartconnect-backend/packages/*/ smartconnect-backend/services/*/ smartconnect-backend/scripts/ smartconnect-backend/api-gateway/ smartconnect-backend/realtime-gateway/ smartconnect-backend/app/; do npm run typecheck --workspace "${d%/}"; done
       - name: Type-check tests
         run: npm run typecheck --workspace tests
       - name: Unit tests (no database)
@@ -100,10 +100,16 @@ jobs:
         run: npm run test --workspace smartconnect-backend/services/workspace
       - name: Messaging service unit tests
         run: npm run test --workspace smartconnect-backend/services/messaging
+      - name: Files service unit tests
+        run: npm run test --workspace smartconnect-backend/services/files
       - name: Realtime gateway tests
         run: npm run test --workspace smartconnect-backend/realtime-gateway
+      # The unified backend (ADR 0016): environment views, ports, start/shutdown order, Socket.IO hand-off. Its
+      # one-process run against a real database is in database.yml (tests/integration/platform/unified-backend.test.ts).
+      - name: Unified backend tests
+        run: npm run test --workspace smartconnect-backend/app
       - name: Build shared packages, services and API gateway
-        run: for d in smartconnect-backend/packages/*/ smartconnect-backend/services/*/ smartconnect-backend/api-gateway/ smartconnect-backend/realtime-gateway/; do npm run build --workspace "${d%/}"; done
+        run: for d in smartconnect-backend/packages/*/ smartconnect-backend/services/*/ smartconnect-backend/api-gateway/ smartconnect-backend/realtime-gateway/ smartconnect-backend/app/; do npm run build --workspace "${d%/}"; done
 
   frontend-web:
     name: Frontend web

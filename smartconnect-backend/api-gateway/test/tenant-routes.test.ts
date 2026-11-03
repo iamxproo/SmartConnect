@@ -124,6 +124,24 @@ describe('routing to the organization and workspace services', () => {
     }
   });
 
+  it('rate-limits organization creation per person, apart from the other organization routes', async () => {
+    // A fresh gateway (and bucket store): earlier tests already created organizations as this user.
+    const fresh = await startGateway({ env: { ORGANIZATION_SERVICE_URL: organization.url } });
+    try {
+      const statuses: number[] = [];
+      for (let i = 0; i < 11; i++) {
+        statuses.push((await request(fresh.server).post('/api/v1/orgs').set(auth).send({})).status);
+      }
+      expect(statuses.slice(0, 10).every((status) => status === 200)).toBe(true);
+      expect(statuses[10]).toBe(429);
+      expect(organization.requests.filter((r) => r.method === 'POST' && r.url === '/api/v1/orgs')).toHaveLength(10);
+      // Listing one's organizations keeps the general budget.
+      expect((await request(fresh.server).get('/api/v1/orgs').set(auth)).status).toBe(200);
+    } finally {
+      await fresh.app.close();
+    }
+  });
+
   it('rate-limits invitation previews per client address', async () => {
     // A fresh gateway (and bucket store): earlier tests already spent part of this address's budget.
     const fresh = await startGateway({ env: { ORGANIZATION_SERVICE_URL: organization.url } });

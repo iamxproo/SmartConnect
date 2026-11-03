@@ -1,6 +1,15 @@
 import { useQuery } from '@tanstack/react-query';
 import { useParams } from '@tanstack/react-router';
-import type { Invitation, InvitationStatus, Member, Membership, Organization, OrgSummary, Role } from '@/lib/api/types';
+import type {
+  CreationEligibility,
+  Invitation,
+  InvitationFilter,
+  Member,
+  Membership,
+  Organization,
+  OrgSummary,
+  Role,
+} from '@/lib/api/types';
 import { useApi } from '@/lib/services';
 import { useApiMutation } from './mutation';
 
@@ -68,6 +77,26 @@ export function useMembers(orgId: string) {
   });
 }
 
+/** Whether anyone besides the caller has joined: one page of two members, asked only when it matters. */
+export function useHasOtherMembers(orgId: string, enabled: boolean) {
+  const api = useApi();
+  return useQuery({
+    queryKey: [...orgKey(orgId), 'members', 'first-two'],
+    queryFn: async () => (await api.get<{ data: Member[] }>(`/orgs/${orgId}/members`, { limit: 2 })).data.length > 1,
+    enabled,
+  });
+}
+
+export function useCreationEligibility(enabled = true) {
+  const api = useApi();
+  return useQuery({
+    queryKey: [...orgsKey, 'creation-eligibility'],
+    queryFn: () => api.get<CreationEligibility>('/orgs/creation-eligibility'),
+    enabled,
+    retry: false,
+  });
+}
+
 export function useCreateOrg() {
   return useApiMutation(
     (api, body: { name: string; slug: string; description?: string }) => api.post<Organization>('/orgs', body),
@@ -101,11 +130,13 @@ export function useRemoveMember(orgId: string) {
   );
 }
 
-export function useInvitations(orgId: string, status: InvitationStatus | '') {
+export function useInvitations(orgId: string, status: InvitationFilter) {
   const api = useApi();
   return useQuery({
     queryKey: [...orgKey(orgId), 'invitations', status],
     queryFn: () => api.listAll<Invitation>(`/orgs/${orgId}/invitations`, { status }),
+    // An email still on its way: look again until the server knows how it went.
+    refetchInterval: (query) => (query.state.data?.some((i) => i.delivery === 'queued') ? 3_000 : false),
   });
 }
 

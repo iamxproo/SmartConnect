@@ -1,11 +1,61 @@
 import { Button } from '@smartconnect/ui/components/button';
 import { Link, Navigate } from '@tanstack/react-router';
-import { Building2, ChevronRight, Plus } from 'lucide-react';
+import { Building2, ChevronRight, MailCheck, Plus } from 'lucide-react';
+import { ResendVerification } from '@/components/auth/resend-verification';
 import { PageContainer, PageHeader } from '@/components/page';
 import { RevealItem } from '@/components/motion/reveal';
 import { EmptyState } from '@/components/states/empty-state';
 import { QueryState } from '@/components/states/query-state';
-import { useOrgs } from '@/lib/queries/orgs';
+import { useUser } from '@/lib/auth';
+import { useCreationEligibility, useOrgs } from '@/lib/queries/orgs';
+
+/**
+ * Someone in no organization yet: start one (if this server lets them, ADR 0017), or join through an invitation.
+ * When the server cannot say, the link is offered and the server decides.
+ */
+function NoOrganizationYet() {
+  const user = useUser();
+  const eligibility = useCreationEligibility();
+  if (eligibility.isPending) {
+    return (
+      <p role="status" className="text-sm text-muted-foreground">
+        Loading…
+      </p>
+    );
+  }
+  const reason = eligibility.data?.reason;
+  if (reason === 'email_not_verified') {
+    return (
+      <EmptyState
+        icon={MailCheck}
+        title="Verify your email to get started"
+        description={`Open the link in the email we sent to ${user.email}. Then you can create your organization, or accept an invitation to join one.`}
+        action={<ResendVerification />}
+      />
+    );
+  }
+  if (eligibility.data && !eligibility.data.allowed) {
+    return (
+      <EmptyState
+        icon={Building2}
+        title="You're not part of a company yet"
+        description="People join a company by invitation. Open the invitation email you received to join one."
+      />
+    );
+  }
+  return (
+    <EmptyState
+      icon={Building2}
+      title="Create your organization"
+      description="Set up your company on SmartConnect. You'll be its owner, and you can invite your employees by email. Have an invitation instead? Open the link in the invitation email to join that company."
+      action={
+        <Button asChild>
+          <Link to="/organizations/new">Create an organization</Link>
+        </Button>
+      }
+    />
+  );
+}
 
 /** Lists the caller's organizations. With exactly one, goes straight into it. */
 export function HomePage() {
@@ -16,20 +66,7 @@ export function HomePage() {
         if (list.length === 1 && list[0]) {
           return <Navigate to="/o/$orgSlugOrId" params={{ orgSlugOrId: list[0].slug }} replace />;
         }
-        if (list.length === 0) {
-          return (
-            <EmptyState
-              icon={Building2}
-              title="You're not part of a company yet"
-              description="Companies are created by authorized administrators, and people join by invitation. Open the invitation email you received to join one. If you expect to create a company, you can try below."
-              action={
-                <Button asChild variant="outline">
-                  <Link to="/organizations/new">Create an organization</Link>
-                </Button>
-              }
-            />
-          );
-        }
+        if (list.length === 0) return <NoOrganizationYet />;
         return (
           <PageContainer>
             <PageHeader

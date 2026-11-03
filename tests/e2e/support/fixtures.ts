@@ -12,6 +12,7 @@ import {
   type Browser,
   type BrowserContext,
   type Page,
+  type TestInfo,
 } from '@playwright/test';
 
 export const PASSWORD = 'correct horse battery staple 42';
@@ -56,8 +57,22 @@ export const verificationToken = (email: string) =>
   mailboxToken(process.env.E2E_IDENTITY_URL!, email, 'email_verification');
 export const invitationToken = (email: string) => mailboxToken(process.env.E2E_ORGANIZATION_URL!, email);
 
-export async function newContext(browser: Browser): Promise<BrowserContext> {
-  return browser.newContext({ extraHTTPHeaders: { 'X-Forwarded-For': nextAddress() } });
+/**
+ * Contexts still open, by the test that created them. The worker's browser outlives every test, so without this the
+ * pages of earlier tests stay signed in, keep polling and keep sockets the realtime gateway re-checks, and the load
+ * grows with every test until the worker restarts. `closeContexts` below closes a test's own contexts when it ends.
+ */
+const openContexts = new WeakMap<TestInfo, Set<BrowserContext>>();
+
+/** A fresh context with its own client address; it is closed when the current test ends, passed or failed. */
+export async function newContext(browser: Browser, address = nextAddress()): Promise<BrowserContext> {
+  const owner = base.info(); // throws outside a running test: every context belongs to exactly one test
+  const context = await browser.newContext({ extraHTTPHeaders: { 'X-Forwarded-For': address } });
+  let open = openContexts.get(owner);
+  if (!open) openContexts.set(owner, (open = new Set()));
+  open.add(context);
+  context.once('close', () => open.delete(context)); // closed by the test itself: nothing left to clean up
+  return context;
 }
 
 async function json<T>(res: Awaited<ReturnType<APIRequestContext['get']>>, status: number): Promise<T> {
@@ -164,5 +179,18 @@ export async function orgOf(browser: Browser, founderName: string, ...memberName
   return { owner, org, members };
 }
 
-export const test = base;
+export const test = base.extend<{ closeContexts: void }>({
+  // Automatic and test-scoped: runs after every test, including failed and timed-out ones, and closes only the
+  // contexts that test created. allSettled: one context failing to close must not keep the others open.
+  closeContexts: [
+    // eslint-disable-next-line no-empty-pattern -- Playwright requires an object pattern; this fixture needs no others
+    async ({}, use, testInfo) => {
+      await use();
+      const open = openContexts.get(testInfo);
+      openContexts.delete(testInfo);
+      if (open) await Promise.allSettled([...open].map((context) => context.close()));
+    },
+    { auto: true },
+  ],
+});
 export { expect };

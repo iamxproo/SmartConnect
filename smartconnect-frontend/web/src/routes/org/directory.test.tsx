@@ -119,6 +119,47 @@ describe('invitations (administrators)', () => {
     expect(stub.callsTo('POST /orgs/org-1/invitations')).toHaveLength(0);
   });
 
+  it('lists every invitation by default, with when each was accepted and where each email stands', async () => {
+    const stub = stubApi({
+      ...base,
+      'GET /orgs/org-1/invitations': () =>
+        page([
+          { ...pending, delivery: 'sent' },
+          { ...pending, id: 'inv-2', email: 'bounced@example.com', delivery: 'failed' },
+          {
+            ...pending,
+            id: 'inv-3',
+            email: 'joined@example.com',
+            status: 'accepted',
+            acceptedAt: '2026-11-04T12:00:00.000Z',
+          },
+          { ...pending, id: 'inv-4', email: 'gone@example.com', status: 'revoked' },
+        ]),
+    });
+    await renderApp('/o/acme/invitations');
+    expect(await screen.findByText(/Email sent/)).toBeInTheDocument();
+    expect(screen.getByText(/Email couldn't be sent/)).toBeInTheDocument();
+    const acceptedOn = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' }).format(
+      new Date('2026-11-04T12:00:00.000Z'),
+    );
+    expect(screen.getByText(new RegExp(`accepted ${acceptedOn}`))).toBeInTheDocument();
+    expect(screen.getByText(/· revoked/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Resend invitation to bounced@example.com' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Resend invitation to joined@example.com' })).not.toBeInTheDocument();
+    expect(stub.callsTo('GET /orgs/org-1/invitations')[0]?.query.get('status')).toBe('all');
+  });
+
+  it('never says an invitation email was sent when it was not', async () => {
+    stubApi({ ...base, 'POST /orgs/org-1/invitations': () => json(201, { ...pending, delivery: 'failed' }) });
+    const { user } = await renderApp('/o/acme/invitations');
+    await screen.findByRole('option', { name: 'Admin' });
+    await user.selectOptions(screen.getByLabelText('Role'), 'Admin');
+    await user.type(screen.getByLabelText('Email address'), 'new@example.com');
+    await user.click(screen.getByRole('button', { name: 'Send invitation' }));
+    expect(await screen.findByText("The invitation email couldn't be sent")).toBeInTheDocument();
+    expect(screen.queryByText('Invitation sent')).not.toBeInTheDocument();
+  });
+
   it('resends and revokes', async () => {
     const stub = stubApi({
       ...base,

@@ -15,12 +15,14 @@ export class CreateInvitationDto {
 }
 
 export const invitationStatuses = ['pending', 'accepted', 'revoked', 'expired'] as const;
+/** A status, or every invitation whatever its status. */
+export const invitationFilters = [...invitationStatuses, 'all'] as const;
 
 export class ListInvitationsQueryDto extends PageQueryDto {
-  @ApiPropertyOptional({ enum: invitationStatuses, default: 'pending' })
+  @ApiPropertyOptional({ enum: invitationFilters, default: 'pending' })
   @IsOptional()
-  @IsIn(invitationStatuses)
-  status?: (typeof invitationStatuses)[number];
+  @IsIn(invitationFilters)
+  status?: (typeof invitationFilters)[number];
 }
 
 /** Invitation tokens travel only in request bodies, never in URLs (which end up in logs). */

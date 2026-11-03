@@ -7,6 +7,7 @@ Single source of truth for SmartConnect's architecture. When a document here and
 | Blueprint modules → services, schema gap register | [blueprint-mapping.md](blueprint-mapping.md) | Phase 0 |
 | Data architecture: one database, 14 service-owned schemas, roles, outbox | [../database/architecture.md](../database/architecture.md) | Implemented |
 | Tenant isolation (RLS, `withTenant()`) | [../database/tenant-isolation.md](../database/tenant-isolation.md) | Implemented |
+| Unified backend: one modular NestJS application, staged migration | [ADR 0016](../decisions/0016-unified-backend.md), [../database/architecture.md#deployment-topology](../database/architecture.md#deployment-topology) | Accepted; Phase 1 built locally (`make backend-start`), not deployed |
 | API conventions (REST, errors, pagination, auth, versioning) | [../api/conventions.md](../api/conventions.md) | Proposed |
 | Real-time delivery (Socket.IO, ordering, resync, presence) | [realtime.md](realtime.md) | Proposed |
 | Design system foundations | [design-system.md](design-system.md) | Foundations defined |

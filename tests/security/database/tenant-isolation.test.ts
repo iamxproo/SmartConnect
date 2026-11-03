@@ -293,6 +293,12 @@ describe('organization: membership-aware policies', () => {
 });
 
 describe('notifications: cross-tenant work claiming', () => {
+  // The deliveries are due a minute ago, explicitly. Left to @default(now()), Prisma fills next_attempt_at from the
+  // HOST clock while the claim compares it with the DATABASE clock (`next_attempt_at <= now()`); the Docker database
+  // runs a few milliseconds behind the host, so a delivery claimed right after it was created was intermittently not
+  // yet due (measured: 13-27 % of immediate claims missed; 0 % with an explicit past due time).
+  const due = () => new Date(Date.now() - 60_000);
+
   it('workers claim due deliveries of every tenant only through claim_notification_deliveries()', async () => {
     const db = clients.notifications;
     const deliveryIds: Record<string, string> = {};
@@ -305,7 +311,7 @@ describe('notifications: cross-tenant work claiming', () => {
             recipientUserId: U,
             type: 'test.ping',
             title: 'ping',
-            deliveries: { create: { transport: 'push' } },
+            deliveries: { create: { transport: 'push', nextAttemptAt: due() } },
           },
           include: { deliveries: true },
         }),
@@ -346,8 +352,8 @@ describe('notifications: cross-tenant work claiming', () => {
           title: 'poison',
           deliveries: {
             create: [
-              { transport: 'push', status: 'failed', attemptCount: 20 },
-              { transport: 'email', status: 'failed', attemptCount: 19 },
+              { transport: 'push', status: 'failed', attemptCount: 20, nextAttemptAt: due() },
+              { transport: 'email', status: 'failed', attemptCount: 19, nextAttemptAt: due() },
             ],
           },
         },

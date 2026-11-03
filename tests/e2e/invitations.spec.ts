@@ -13,7 +13,7 @@ test('an admin invites through the UI; the wrong account is refused, the right o
   await admin.page.getByLabel('Email address').fill(invitee.email);
   await admin.page.getByLabel('Role').selectOption(org.roles.member);
   await admin.page.getByRole('button', { name: 'Send invitation' }).click();
-  await expect(admin.page.getByText('Invitation sent')).toBeVisible();
+  await expect(admin.page.getByText('Invitation sent', { exact: true })).toBeVisible();
   const sent = admin.page.getByRole('region', { name: 'Sent invitations' });
   await expect(sent.getByText(invitee.email)).toBeVisible();
 

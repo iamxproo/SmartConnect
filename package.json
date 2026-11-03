@@ -11,6 +11,7 @@
     "smartconnect-backend/scripts",
     "smartconnect-backend/api-gateway",
     "smartconnect-backend/realtime-gateway",
+    "smartconnect-backend/app",
     "smartconnect-frontend/web",
     "smartconnect-frontend/mobile",
     "smartconnect-frontend/packages/*",

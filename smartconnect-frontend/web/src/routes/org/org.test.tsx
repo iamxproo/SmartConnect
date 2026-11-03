@@ -1,18 +1,52 @@
 import { screen, waitFor, within } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 import { json, problem, stubApi } from '@/test/api-stub';
-import { acme, globex, inAcme, member, membership, page, signedIn } from '@/test/fixtures';
+import { acme, globex, inAcme, member, membership, page, signedIn, user as account, workspace } from '@/test/fixtures';
 import { axeViolations, renderApp } from '@/test/render-app';
 
 const desktopSidebar = () => within(screen.getByRole('complementary', { name: 'Sidebar' }));
 
 describe('organization list', () => {
-  it('explains that companies are created by administrators and joined by invitation when there are none', async () => {
-    stubApi({ ...signedIn(), 'GET /orgs': () => ({ data: [] }) });
+  const noOrgs = (eligibility: object) => ({
+    ...signedIn(),
+    'GET /orgs': () => ({ data: [] }),
+    'GET /orgs/creation-eligibility': () => eligibility,
+  });
+
+  it('offers to create an organization, or to join by invitation, when the server allows creating one', async () => {
+    stubApi(noOrgs({ allowed: true, reason: null }));
+    await renderApp('/');
+    expect(await screen.findByRole('heading', { name: 'Create your organization' })).toBeInTheDocument();
+    expect(screen.getByText(/You'll be its owner, and you can invite your employees by email/)).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Create an organization' })).toHaveAttribute('href', '/organizations/new');
+  });
+
+  it('explains joining by invitation, without a dead-end link, when this server keeps creation to its administrators', async () => {
+    stubApi(noOrgs({ allowed: false, reason: 'not_allowed' }));
     await renderApp('/');
     expect(await screen.findByText("You're not part of a company yet")).toBeInTheDocument();
-    expect(screen.getByText(/created by authorized administrators, and people join by invitation/)).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: 'Create an organization' })).toHaveAttribute('href', '/organizations/new');
+    expect(screen.getByText(/People join a company by invitation/)).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'Create an organization' })).not.toBeInTheDocument();
+  });
+
+  it('asks an unverified person to verify first, and offers a new verification email', async () => {
+    stubApi({
+      ...noOrgs({ allowed: false, reason: 'email_not_verified' }),
+      ...signedIn(account({ emailVerified: false })),
+    });
+    await renderApp('/');
+    expect(await screen.findByRole('heading', { name: 'Verify your email to get started' })).toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: 'Resend verification email' }).length).toBeGreaterThan(0);
+    expect(screen.queryByRole('link', { name: 'Create an organization' })).not.toBeInTheDocument();
+  });
+
+  it('still offers the link, and lets the server decide, when it cannot say', async () => {
+    stubApi({ ...signedIn(), 'GET /orgs': () => ({ data: [] }) }); // no eligibility answer
+    await renderApp('/');
+    expect(await screen.findByRole('link', { name: 'Create an organization' })).toHaveAttribute(
+      'href',
+      '/organizations/new',
+    );
   });
 
   it('goes straight into the only organization', async () => {
@@ -90,6 +124,24 @@ describe('creating an organization', () => {
     expect(stub.callsTo('POST /orgs')[0]?.body).toEqual({ name: 'Acme Corp', slug: 'acme-corp' });
   });
 
+  it('says why creating is not possible, and keeps the button off, when the server says so', async () => {
+    for (const [reason, text] of [
+      ['not_allowed', /created by the platform's administrators/],
+      ['limit_reached', /most organizations one account can have/],
+      ['email_not_verified', /Verify your email address first/],
+    ] as const) {
+      stubApi({
+        ...signedIn(),
+        'GET /orgs': () => ({ data: [] }),
+        'GET /orgs/creation-eligibility': () => ({ allowed: false, reason }),
+      });
+      const view = await renderApp('/organizations/new');
+      expect(await screen.findByText(text)).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Create organization' })).toBeDisabled();
+      view.unmount();
+    }
+  });
+
   it('shows a taken address on the field', async () => {
     stubApi({
       ...signedIn(),
@@ -100,6 +152,45 @@ describe('creating an organization', () => {
     await user.type(await screen.findByLabelText('Company name'), 'Acme');
     await user.click(screen.getByRole('button', { name: 'Create organization' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('address is already taken');
+  });
+});
+
+describe('a new organization', () => {
+  const region = () => screen.findByRole('region', { name: 'Get started' });
+
+  it('leads its owner to invite the team and to create a workspace', async () => {
+    stubApi({ ...inAcme(['*']), 'GET /orgs/org-1/members': () => page([member()]) });
+    await renderApp('/o/acme');
+    const steps = within(await region());
+    expect(steps.getByRole('link', { name: 'Invite people' })).toHaveAttribute('href', '/o/acme/invitations');
+    expect(steps.getByRole('link', { name: 'Open workspaces' })).toHaveAttribute('href', '/o/acme/workspaces');
+  });
+
+  it('marks what is done, and goes away once others have joined and a workspace exists', async () => {
+    const two = page([member(), member({ id: 'member-2', userId: 'user-2' })]);
+    stubApi({ ...inAcme(['*']), 'GET /orgs/org-1/members': () => two });
+    const first = await renderApp('/o/acme');
+    const steps = within(await region());
+    expect(steps.getByLabelText('Done')).toBeInTheDocument();
+    expect(steps.queryByRole('link', { name: 'Invite people' })).not.toBeInTheDocument();
+    first.unmount();
+
+    stubApi({
+      ...inAcme(['*']),
+      'GET /orgs/org-1/members': () => two,
+      'GET /orgs/org-1/workspaces': () => page([workspace()]),
+    });
+    await renderApp('/o/acme');
+    expect(await screen.findByText('Makers of everything')).toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Get started' })).not.toBeInTheDocument();
+  });
+
+  it('is not shown to members who can do neither, and asks nothing for it', async () => {
+    const stub = stubApi(inAcme());
+    await renderApp('/o/acme');
+    expect(await screen.findByText('Makers of everything')).toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Get started' })).not.toBeInTheDocument();
+    expect(stub.callsTo('GET /orgs/org-1/members')).toHaveLength(0);
   });
 });
 

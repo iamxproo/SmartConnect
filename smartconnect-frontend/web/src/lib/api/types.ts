@@ -87,6 +87,10 @@ export interface Role {
 }
 
 export type InvitationStatus = 'pending' | 'accepted' | 'revoked' | 'expired';
+/** A status to list, or every invitation. */
+export type InvitationFilter = InvitationStatus | 'all';
+/** Where an invitation's latest email stands, as the server knows it ("unknown" after a restart). */
+export type InvitationDelivery = 'queued' | 'sent' | 'failed' | 'disabled' | 'unknown';
 
 export interface Invitation {
   id: string;
@@ -95,6 +99,15 @@ export interface Invitation {
   status: InvitationStatus;
   expiresAt: string;
   createdAt: string;
+  acceptedAt?: string | null;
+  /** Absent from an older server: treated as unknown. */
+  delivery?: InvitationDelivery;
+}
+
+/** Whether the signed-in person may create an organization now (GET /orgs/creation-eligibility). */
+export interface CreationEligibility {
+  allowed: boolean;
+  reason: 'not_allowed' | 'email_not_verified' | 'limit_reached' | null;
 }
 
 export interface InvitationPreview {

@@ -10,6 +10,7 @@
 - **Services never share tables.** They talk over REST/internal APIs (synchronous) and over events published from a **transactional outbox** (asynchronous, durable).
 - **Redis is for caching, ephemeral coordination and WebSocket fan-out only.** It is never the durable event source.
 - **Multi-tenancy is enforced in the database** with row-level security (RLS) on every tenant table and tenant-aware composite foreign keys. See [tenant-isolation.md](tenant-isolation.md).
+- **Today each service with code runs as its own NestJS process.** [ADR 0016](../decisions/0016-unified-backend.md) (Accepted 2026-11-03) plans one unified application, migrated in stages. **That has not been built.** It changes how the code is deployed, not who owns which schema: see [Deployment topology](#deployment-topology).
 
 ```mermaid
 flowchart LR
@@ -56,6 +57,40 @@ Every schema also contains `outbox_events`, `processed_events` and `_prisma_migr
 
 The authoritative service list is the `services` array in [`010_bootstrap.sql`](../../infrastructure/compose/postgres/init/010_bootstrap.sql). A test asserts it matches the tooling and the `smartconnect-backend/services/*` directories.
 
+## Deployment topology
+
+[ADR 0016](../decisions/0016-unified-backend.md) moves SmartConnect from one process per service to one modular NestJS application, in stages.
+- **Built:** the seven-process topology (still the default, and the rollback path) and Phase 1 (`make backend-start`, built and verified locally on 2026-11-04; not deployed).
+- **Planned:** the final topology.
+
+**What stays the same in every topology:**
+- each service keeps its schema, its migrator and runtime roles, its Prisma project and its migration history;
+- each service connects **only with its own runtime role**;
+- RLS, the SECURITY DEFINER functions and the privileges that make SQL across schemas fail are unchanged;
+- migrator credentials never reach a running process.
+
+| | Seven processes (implemented) | Phase 1: one process (implemented, local) | Final modular monolith (planned, not built) |
+|---|---|---|---|
+| Processes | Seven: `api-gateway`, `realtime-gateway`, and the identity, organization, workspace, messaging and files services | One process (`smartconnect-backend/app`) hosting the seven existing applications. The services and the realtime gateway listen on internal loopback ports; the API gateway owns the one public port, which also carries Socket.IO | One process and one Nest application. Each service with code is a feature module; the nine schema-only services get no module |
+| Database connections | One pool per service process, with `sc_<svc>_app` | Unchanged: one pool per hosted service, each with its own runtime role | One pool per module, each with its own runtime role. **Never a shared role** |
+| Reading another service's data | HTTP call to its API with the caller's token | Unchanged, over loopback | The owning module's in-process port, with the same checks as the HTTP endpoint it replaces |
+| SQL across schemas | Impossible (privileges) | Impossible | Impossible |
+| Migrations | Per service, with its migrator role (`make db-migrate`) | Unchanged | Unchanged. The production runner is pending (ADR 0016, P3) |
+| Events | Outbox rows in each schema (no relay yet); messaging publishes to Redis pub/sub for realtime | Unchanged | Unchanged |
+
+```mermaid
+flowchart LR
+  subgraph APP["Final topology (planned): one process, one Nest application"]
+    I[identity module] -->|sc_identity_app| S1[(identity)]
+    O[organization module] -->|sc_organization_app| S2[(organization)]
+    W[workspace module] -->|sc_workspace_app| S3[(workspace)]
+    M[messaging module] -->|sc_messaging_app| S4[(messaging)]
+    F[files module] -->|sc_files_app| S5[(files)]
+    W -. in-process port, as the caller .-> O
+    M -. in-process port, as the caller .-> W
+  end
+```
+
 ## Communication rules
 
 | Need | Mechanism | Never |
@@ -65,6 +100,8 @@ The authoritative service list is the `services` array in [`010_bootstrap.sql`](
 | Publish a change durably | Insert into own `outbox_events` **in the same transaction** as the state change; the service's relay publishes afterwards | Publishing to a broker inside the business transaction (dual-write) |
 | Consume idempotently | Record `(event_id, handler)` in own `processed_events` in the same transaction as the handler's writes | Assuming exactly-once delivery |
 | Ephemeral state | Redis with TTLs (presence heartbeats, typing, rate limits, locks, Socket.IO adapter) | Durable business state in Redis |
+
+In the final topology of [ADR 0016](../decisions/0016-unified-backend.md), "its REST/internal API" means the owning module's in-process port. The port applies the same authorization as the HTTP endpoint it replaces; every other rule in this table is unchanged.
 
 ```mermaid
 sequenceDiagram

@@ -45,6 +45,50 @@ function writeKeys(dir: string) {
   return { privateFile: path.join(dir, 'private.jwk.json'), publicFile: path.join(dir, 'public.jwks.json') };
 }
 
+/** Environment prefixes of the unified backend's internal applications (smartconnect-backend/app/src/apps.ts). */
+const UNIFIED_PREFIX: Record<string, string> = {
+  identity: 'IDENTITY',
+  organization: 'ORGANIZATION',
+  workspace: 'WORKSPACE',
+  messaging: 'MESSAGING',
+  'realtime-gateway': 'REALTIME',
+  files: 'FILES',
+};
+/** Names that are the public gateway's when unprefixed, and namespaced for every internal application. */
+const PER_APPLICATION = new Set(['PORT', 'HOST', 'TRUST_PROXY_HOPS', 'API_DOCS_ENABLED']);
+
+/**
+ * The unified backend's environment (ADR 0016 Phase 1), derived from the same per-service table the seven-process
+ * stack uses, so both modes run the services with the same settings. Service URLs are dropped (the unified backend
+ * computes them on loopback); each service's port and database become its namespaced variables; the gateway's
+ * settings stay unprefixed. A value two services would need differently fails loudly instead of being guessed.
+ */
+function unifiedEnvironment(
+  stack: [string, string, number, Record<string, string | undefined>][],
+  databaseUrl: (name: string) => string | undefined,
+): Record<string, string | undefined> {
+  const env: Record<string, string | undefined> = {};
+  const set = (key: string, value: string | undefined) => {
+    if (env[key] !== undefined && env[key] !== value)
+      throw new Error(`unified e2e stack: conflicting values for ${key}`);
+    env[key] = value;
+  };
+  for (const [name, , port, extra] of stack) {
+    const prefix = UNIFIED_PREFIX[name];
+    if (prefix) {
+      set(`${prefix}_INTERNAL_PORT`, String(port));
+      if (name !== 'realtime-gateway') set(`${prefix}_DATABASE_URL`, databaseUrl(name));
+    } else {
+      set('PORT', String(port));
+    }
+    for (const [key, value] of Object.entries(extra)) {
+      if (key.endsWith('_SERVICE_URL')) continue;
+      set(prefix && PER_APPLICATION.has(key) ? `${prefix}_${key}` : key, value);
+    }
+  }
+  return env;
+}
+
 async function waitReady(name: string, url: string, child: ChildProcess, timeoutMs = 90_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -87,7 +131,13 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
       'organization',
       service('services/organization'),
       PORTS.organization,
-      { IDENTITY_SERVICE_URL: local(PORTS.identity), ORGANIZATION_CREATOR_EMAILS: founders.join(',') },
+      {
+        IDENTITY_SERVICE_URL: local(PORTS.identity),
+        // Self-service creation (ADR 0017), as production is meant to run; the founders stay allowlisted, which
+        // exempts them from the cap on owned organizations.
+        ORGANIZATION_CREATION: 'open',
+        ORGANIZATION_CREATOR_EMAILS: founders.join(','),
+      },
     ],
     [
       'workspace',
@@ -117,7 +167,8 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
         REDIS_URL: redisUrl,
         REALTIME_EVENTS_CHANNEL: events,
         CORS_ALLOWED_ORIGINS: WEB_URL,
-        REAUTHORIZE_INTERVAL_SECONDS: '5',
+        // Short, so access changes reach open sockets within a test; the load test can ask for the production default.
+        REAUTHORIZE_INTERVAL_SECONDS: process.env.E2E_REAUTHORIZE_INTERVAL_SECONDS ?? '5',
       },
     ],
     [
@@ -155,20 +206,41 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
     const running = children.filter((child) => child.exitCode === null);
     await Promise.all(running.map((child) => new Promise((resolve) => child.once('exit', resolve))));
   };
+  // make e2e-unified (E2E_BACKEND=unified): the same seven applications in ONE process, smartconnect-backend/app. Its
+  // public port (the gateway's) also carries Socket.IO, so Vite sends /realtime there; the internal ports, and with
+  // them the dev mailboxes the tests read, stay where they are in the seven-process stack.
+  const unified = process.env.E2E_BACKEND === 'unified';
   try {
-    for (const [name, cwd, port, extra] of stack) {
-      const log = openSync(path.join(logDir, `${name}.log`), 'w');
+    if (unified) {
+      const log = openSync(path.join(logDir, 'backend.log'), 'w');
       const env: Record<string, string | undefined> = {
         ...process.env,
         ...common,
-        ...extra,
-        PORT: String(port),
-        DATABASE_URL: services[name]?.appUrl,
+        ...unifiedEnvironment(stack, (name) => services[name]?.appUrl),
       };
       for (const [key, value] of Object.entries(env)) if (value === undefined) delete env[key];
-      const child = spawn(process.execPath, ['dist/main.js'], { cwd, env, stdio: ['ignore', log, log] });
+      const child = spawn(process.execPath, ['dist/main.js'], {
+        cwd: service('app'),
+        env,
+        stdio: ['ignore', log, log],
+      });
       children.push(child);
-      await waitReady(name, `${local(port)}/health/ready`, child);
+      await waitReady('unified backend', `${local(PORTS.gateway)}/health/ready`, child);
+    } else {
+      for (const [name, cwd, port, extra] of stack) {
+        const log = openSync(path.join(logDir, `${name}.log`), 'w');
+        const env: Record<string, string | undefined> = {
+          ...process.env,
+          ...common,
+          ...extra,
+          PORT: String(port),
+          DATABASE_URL: services[name]?.appUrl,
+        };
+        for (const [key, value] of Object.entries(env)) if (value === undefined) delete env[key];
+        const child = spawn(process.execPath, ['dist/main.js'], { cwd, env, stdio: ['ignore', log, log] });
+        children.push(child);
+        await waitReady(name, `${local(port)}/health/ready`, child);
+      }
     }
     const viteLog = openSync(path.join(logDir, 'vite.log'), 'w');
     const vite = spawn(
@@ -179,7 +251,7 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
         env: {
           ...process.env,
           WEB_DEV_API_TARGET: local(PORTS.gateway),
-          WEB_DEV_REALTIME_TARGET: local(PORTS.realtime),
+          WEB_DEV_REALTIME_TARGET: local(unified ? PORTS.gateway : PORTS.realtime),
         },
         stdio: ['ignore', viteLog, viteLog],
       },
@@ -198,6 +270,6 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
   process.env.E2E_IDENTITY_URL = local(PORTS.identity);
   process.env.E2E_ORGANIZATION_URL = local(PORTS.organization);
   process.env.E2E_LOG_DIR = logDir;
-  console.log(`[e2e] stack ready (run ${runId}); logs in ${logDir}`);
+  console.log(`[e2e] ${unified ? 'unified backend' : 'stack'} ready (run ${runId}); logs in ${logDir}`);
   return stop;
 }

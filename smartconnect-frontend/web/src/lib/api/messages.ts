@@ -13,9 +13,15 @@ const BY_CODE: Record<string, string> = {
   email_not_verified: 'Verify your email address first. Use the link in the email we sent you.',
   already_member: 'This person is already a member of the organization.',
   organization_creation_not_allowed:
-    'Your account is not authorized to create organizations. Companies are created by authorized administrators; ask to be invited to yours.',
+    'Your account is not authorized to create organizations here. Ask the administrators of your company to invite you instead.',
+  organization_limit_reached:
+    'You already own the most organizations one account can have. Hand one over or delete it before creating another.',
   slug_taken: 'That address is already taken. Choose another.',
   invitation_pending: 'An invitation is already pending for this email address. Resend it instead.',
+  invitation_not_pending: 'This invitation was already accepted or withdrawn, so it cannot be resent.',
+  owner_required: 'Only owners can do this.',
+  storage_quota_exceeded: 'File storage is full. Delete files you no longer need, or ask an administrator.',
+  storage_unavailable: 'File storage is unavailable right now. Try again in a moment.',
   last_admin: 'You are the last administrator. Make someone else an administrator first.',
   channel_name_taken: 'A channel with that name already exists in this workspace.',
   not_a_channel_member: 'Join this channel to post in it.',

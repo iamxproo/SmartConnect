@@ -20,13 +20,31 @@ import { OrgMembershipGuard } from './org/org-membership.guard.js';
 import { ORGANIZATION_CLIENT, OrganizationDirectory } from './org/organization-directory.js';
 import { FILE_STORAGE, type FileStorage } from './storage/file-storage.js';
 import { LocalFileStorage } from './storage/local-file-storage.js';
+import { R2FileStorage } from './storage/r2-file-storage.js';
 import { StagingSweeper } from './storage/staging-sweeper.js';
+import { StorageBudget } from './storage/storage-budget.js';
 
 export interface FilesDependencies {
   config: FilesConfig;
   prisma: FilesPrisma;
-  /** Tests only: a storage other than the local-filesystem driver. */
+  /** Tests only: a storage other than the one the configuration names. */
   storage?: FileStorage;
+}
+
+/** The driver FILES_STORAGE_PROVIDER names: the local directory (default outside production) or Cloudflare R2. */
+export function createStorage(config: FilesConfig): FileStorage {
+  if (config.storage.provider === 'r2') {
+    const { endpoint, bucket, region, accessKeyId, secretAccessKey, timeoutMs } = config.storage;
+    return new R2FileStorage({
+      endpoint,
+      bucket,
+      region,
+      credentials: { accessKeyId, secretAccessKey },
+      timeoutMs,
+      stagingDir: config.stagingDir,
+    });
+  }
+  return new LocalFileStorage(config.storageDir);
 }
 
 @Injectable()
@@ -38,6 +56,16 @@ class PrismaLifecycle implements OnApplicationShutdown {
   }
 }
 
+/** Closes the storage driver's idle connections (R2's keep-alive sockets) on shutdown. */
+@Injectable()
+class StorageLifecycle implements OnApplicationShutdown {
+  constructor(@Inject(FILE_STORAGE) private readonly storage: FileStorage & { close?: () => void }) {}
+
+  onApplicationShutdown(): void {
+    this.storage.close?.();
+  }
+}
+
 /**
  * Files service root module. Owns schema "files" and nothing else. Every route is protected unless marked
  * @Public() (AccessTokenGuard), and protected routes must be under /orgs/{orgId} with the caller an active member of
@@ -45,11 +73,7 @@ class PrismaLifecycle implements OnApplicationShutdown {
  */
 @Module({})
 export class AppModule {
-  static register({
-    config,
-    prisma,
-    storage = new LocalFileStorage(config.storageDir),
-  }: FilesDependencies): DynamicModule {
+  static register({ config, prisma, storage = createStorage(config) }: FilesDependencies): DynamicModule {
     const readinessChecks: ReadinessCheck[] = [
       {
         name: 'database',
@@ -77,7 +101,9 @@ export class AppModule {
         AttachmentAccess,
         FilesService,
         PrismaLifecycle,
+        StorageLifecycle,
         StagingSweeper,
+        StorageBudget,
         rootNotFoundHandler(config.errorTypeBaseUrl),
         { provide: APP_GUARD, useClass: AccessTokenGuard },
         { provide: APP_GUARD, useClass: OrgMembershipGuard },

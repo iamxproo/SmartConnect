@@ -21,7 +21,7 @@ describe('OpenAPI document', () => {
       ),
     );
 
-  it('is OpenAPI 3.1 and documents only real routes: health, auth, invitation and admin operations (no placeholders)', () => {
+  it('is OpenAPI 3.1 and documents only real routes: health, auth, organization creation, invitation and admin operations (no placeholders)', () => {
     expect(document.openapi).toBe('3.1.0');
     expect(document.info).toMatchObject({ title: 'SmartConnect API', version: 'v1' });
     expect(Object.keys(document.paths).sort()).toEqual([
@@ -43,6 +43,7 @@ describe('OpenAPI document', () => {
       '/api/v1/auth/sessions/{sessionId}',
       '/api/v1/invitations/accept',
       '/api/v1/invitations/preview',
+      '/api/v1/orgs',
       '/api/v1/orgs/{orgId}/invitations',
       '/health/live',
       '/health/ready',
@@ -75,6 +76,7 @@ describe('OpenAPI document', () => {
       'POST /api/v1/auth/password/change',
       'POST /api/v1/auth/sessions/revoke-others',
       'POST /api/v1/invitations/accept',
+      'POST /api/v1/orgs',
       'POST /api/v1/orgs/{orgId}/invitations',
     ]);
     expect(document.components?.securitySchemes?.accessToken).toMatchObject({ type: 'http', scheme: 'bearer' });

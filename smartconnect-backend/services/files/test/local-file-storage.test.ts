@@ -138,4 +138,16 @@ describe('sweepStaging', () => {
     expect(await storage.sweepStaging(60 * 60 * 1000)).toBe(1);
     expect(await readdir(path.join(root, '.tmp'))).toEqual(['live']);
   });
+
+  it("reports an object's size, nothing for a missing one, and the stored total without staged uploads", async () => {
+    expect(await storage.usage()).toEqual({ bytes: 0, objects: 0 });
+    const staged = await storage.stage(chunks('hello'), { maxBytes: 100, expectedBytes: 5 });
+    expect(await storage.usage()).toEqual({ bytes: 0, objects: 0 }); // staged, not stored
+    await staged.promote(KEY);
+    await (await storage.stage(chunks('abc'), { maxBytes: 100, expectedBytes: 3 })).promote(storageKeyOf(ORG, FILE, 2));
+    expect(await storage.head(KEY)).toEqual({ sizeBytes: 5 });
+    expect(await storage.head(storageKeyOf(ORG, FILE, 3))).toBeUndefined();
+    expect(await storage.usage()).toEqual({ bytes: 8, objects: 2 });
+    await expect(storage.head('../outside')).rejects.toBeInstanceOf(StorageKeyError);
+  });
 });

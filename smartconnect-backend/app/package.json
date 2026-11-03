@@ -1,0 +1,39 @@
+{
+  "name": "@smartconnect/backend",
+  "version": "0.0.0",
+  "private": true,
+  "description": "SmartConnect unified backend (ADR 0016, Phase 1): one Node.js process hosting the existing API gateway, realtime gateway and five services, each behind its own internal HTTP boundary on a loopback port. The API gateway owns the single public HTTP server, which also carries Socket.IO.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "build:deps": "npm run build --workspace @smartconnect/api-gateway --workspace @smartconnect/realtime-gateway --workspace @smartconnect/identity-service --workspace @smartconnect/organization-service --workspace @smartconnect/workspace-service --workspace @smartconnect/messaging-service --workspace @smartconnect/files-service",
+    "prebuild": "npm run build:deps",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node --env-file-if-exists=../../.secrets/smtp.env --env-file-if-exists=../../.secrets/organization.env dist/main.js",
+    "pretypecheck": "npm run build:deps",
+    "typecheck": "tsc -p tsconfig.json",
+    "pretest": "npm run build:deps",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@nestjs/common": "12.2.0",
+    "@smartconnect/api-gateway": "0.0.0",
+    "@smartconnect/backend-kit": "0.0.0",
+    "@smartconnect/files-service": "0.0.0",
+    "@smartconnect/identity-service": "0.0.0",
+    "@smartconnect/messaging-service": "0.0.0",
+    "@smartconnect/organization-service": "0.0.0",
+    "@smartconnect/realtime-gateway": "0.0.0",
+    "@smartconnect/workspace-service": "0.0.0",
+    "reflect-metadata": "0.2.2"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "socket.io": "4.8.4",
+    "socket.io-client": "4.8.4",
+    "typescript": "6.0.3",
+    "vitest": "5.0.5"
+  }
+}

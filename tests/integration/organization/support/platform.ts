@@ -37,6 +37,8 @@ export async function startPlatform(
   options: {
     /** Replaces the InvitationDevMailbox; built with the service's capturing logger so log assertions see everything. */
     notifier?: (logger: CapturingLogger) => InvitationNotifier;
+    /** More organization-service settings (e.g. ORGANIZATION_CREATION=open). */
+    env?: Record<string, string>;
   } = {},
 ): Promise<Platform> {
   const identity = await startIdentity({ listen: true });
@@ -47,6 +49,7 @@ export async function startPlatform(
     AUTH_JWT_PUBLIC_JWKS: identity.publicJwks,
     IDENTITY_SERVICE_URL: urlOf(identity),
     ORGANIZATION_CREATOR_EMAILS: founderEmail,
+    ...options.env,
   });
   const prisma = createPrismaClient({ connectionString: config.databaseUrl, maxConnections: 8 });
   const mailbox = new InvitationDevMailbox();

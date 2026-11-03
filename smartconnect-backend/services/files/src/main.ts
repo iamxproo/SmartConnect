@@ -27,6 +27,8 @@ async function bootstrap(): Promise<void> {
       url: `http://${config.host}:${config.port}`,
       env: config.env,
       docs: config.apiDocsEnabled ? '/docs' : 'disabled',
+      storage: config.storage.provider,
+      storageBudgetBytes: config.storageBudgetBytes,
     },
     'Bootstrap',
   );

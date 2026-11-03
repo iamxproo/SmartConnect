@@ -53,6 +53,7 @@ async function bootstrap(): Promise<void> {
       env: config.env,
       docs: config.apiDocsEnabled ? '/docs' : 'disabled',
       invitationNotifier: config.invitationNotifier,
+      organizationCreation: config.organizationCreation,
       organizationCreators: config.organizationCreatorEmails.size,
     },
     'Bootstrap',

@@ -13,7 +13,7 @@ import { EmptyState } from '@/components/states/empty-state';
 import { QueryState } from '@/components/states/query-state';
 import { useToast } from '@/components/toast/toaster';
 import { describeError } from '@/lib/api/messages';
-import type { Invitation, InvitationStatus } from '@/lib/api/types';
+import type { Invitation, InvitationDelivery, InvitationFilter } from '@/lib/api/types';
 import {
   useCan,
   useInvitations,
@@ -26,6 +26,52 @@ import {
 import { isEmail } from '@/lib/validation';
 
 const dateFormat = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' });
+
+/** What happened to the email, worded for the inviter. Unknown (e.g. after a server restart) says nothing. */
+const DELIVERY: Record<InvitationDelivery, { label: string; tone?: 'warning' } | null> = {
+  queued: { label: 'Sending email…' },
+  sent: { label: 'Email sent' },
+  failed: { label: "Email couldn't be sent", tone: 'warning' },
+  disabled: { label: 'Email not sent (delivery is off)', tone: 'warning' },
+  unknown: null,
+};
+
+/** The toast after sending or resending: never "sent" for an email that was not. */
+function deliveryToast(invitation: Invitation, sentTitle: string) {
+  switch (invitation.delivery) {
+    case 'queued':
+      return { title: 'Invitation created', description: `Sending the email to ${invitation.email}…` };
+    case 'failed':
+      return {
+        title: "The invitation email couldn't be sent",
+        description: 'The invitation is saved. Resend it from the list.',
+        tone: 'error' as const,
+      };
+    case 'disabled':
+      return {
+        title: 'Invitation created',
+        description: 'Email delivery is turned off on this server, so no email was sent.',
+        tone: 'error' as const,
+      };
+    default:
+      return { title: sentTitle, description: invitation.email };
+  }
+}
+
+/** The status line under an address: when it expires, expired, was accepted, or that it was revoked. */
+function statusLine(invitation: Invitation) {
+  const expires = dateFormat.format(new Date(invitation.expiresAt));
+  switch (invitation.status) {
+    case 'pending':
+      return `expires ${expires}`;
+    case 'expired':
+      return `expired ${expires}`;
+    case 'accepted':
+      return invitation.acceptedAt ? `accepted ${dateFormat.format(new Date(invitation.acceptedAt))}` : 'accepted';
+    case 'revoked':
+      return 'revoked';
+  }
+}
 
 export function InvitationsPage() {
   const org = useRequiredOrg();
@@ -63,8 +109,8 @@ function InviteForm() {
       roleId: values.roleId ? undefined : 'Choose a role.',
     }),
     submit: async (values) => {
-      await send.mutateAsync({ email: values.email.trim(), roleId: values.roleId });
-      toast({ title: 'Invitation sent', description: values.email.trim() });
+      const invitation = await send.mutateAsync({ email: values.email.trim(), roleId: values.roleId });
+      toast(deliveryToast(invitation, 'Invitation sent'));
       formRef.current?.reset();
     },
   });
@@ -106,7 +152,7 @@ function InviteForm() {
 
 function InvitationList() {
   const org = useRequiredOrg();
-  const [status, setStatus] = useState<InvitationStatus | ''>('');
+  const [status, setStatus] = useState<InvitationFilter>('all');
   const invitations = useInvitations(org.id, status);
   return (
     <section aria-labelledby="invitation-list-heading" className="flex flex-col gap-3">
@@ -118,9 +164,9 @@ function InvitationList() {
           aria-label="Filter by status"
           className="w-40"
           value={status}
-          onChange={(event) => setStatus(event.target.value as InvitationStatus | '')}
+          onChange={(event) => setStatus(event.target.value as InvitationFilter)}
         >
-          <option value="">All</option>
+          <option value="all">All</option>
           <option value="pending">Pending</option>
           <option value="accepted">Accepted</option>
           <option value="expired">Expired</option>
@@ -153,14 +199,20 @@ function InvitationRow({ invitation }: { invitation: Invitation }) {
   const revoke = useRevokeInvitation(org.id);
   const [revoking, setRevoking] = useState(false);
   const open = invitation.status === 'pending' || invitation.status === 'expired';
+  const delivery = invitation.status === 'pending' ? DELIVERY[invitation.delivery ?? 'unknown'] : null;
 
   return (
     <div className="flex flex-wrap items-center gap-3 rounded-md border border-border px-3 py-2">
       <div className="min-w-0 flex-1">
         <p className="truncate text-sm font-medium">{invitation.email}</p>
         <p className="text-xs text-muted-foreground">
-          {invitation.role.name} · {invitation.status === 'pending' ? 'expires' : 'expired'}{' '}
-          {dateFormat.format(new Date(invitation.expiresAt))}
+          {invitation.role.name} · {statusLine(invitation)}
+          {delivery ? (
+            <span className={delivery.tone === 'warning' ? 'font-medium text-warning' : undefined}>
+              {' '}
+              · {delivery.label}
+            </span>
+          ) : null}
         </p>
       </div>
       <Badge>{invitation.status}</Badge>
@@ -172,7 +224,12 @@ function InvitationRow({ invitation }: { invitation: Invitation }) {
           disabled={resend.isPending}
           onClick={() =>
             resend.mutate(invitation.id, {
-              onSuccess: () => toast({ title: 'Invitation resent', description: 'The previous link no longer works.' }),
+              onSuccess: (renewed) =>
+                toast(
+                  renewed.delivery === 'sent' || renewed.delivery === undefined || renewed.delivery === 'unknown'
+                    ? { title: 'Invitation resent', description: 'The previous link no longer works.' }
+                    : deliveryToast(renewed, 'Invitation resent'),
+                ),
               onError: (error) => toast({ title: "Couldn't resend", description: describeError(error), tone: 'error' }),
             })
           }

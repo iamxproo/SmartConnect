@@ -229,4 +229,38 @@ describe('BackgroundMailer', () => {
     expect(close).toHaveBeenCalledTimes(1);
     await expect(new BackgroundMailer({ send: vi.fn() }, l).close()).resolves.toBeUndefined();
   });
+
+  it('tells the caller the final outcome once: sent, failed after retries, failed when dropped', async () => {
+    const { l } = logger();
+    const outcomes: string[] = [];
+    const send = vi
+      .fn()
+      .mockResolvedValueOnce({ id: null })
+      .mockRejectedValueOnce(transient())
+      .mockRejectedValueOnce(transient());
+    const mailer = new BackgroundMailer({ send }, l, { concurrency: 1, maxQueue: 1, maxAttempts: 2 });
+    mailer.enqueue('a', message, (outcome) => outcomes.push(`a:${outcome}`)); // starts at once
+    mailer.enqueue('b', message, (outcome) => outcomes.push(`b:${outcome}`)); // waits in the queue
+    mailer.enqueue('c', message, (outcome) => outcomes.push(`c:${outcome}`)); // queue full: dropped
+    expect(outcomes).toEqual(['c:failed']);
+    await vi.advanceTimersByTimeAsync(60_000);
+    await mailer.drain(1000);
+    expect(outcomes).toEqual(['c:failed', 'a:sent', 'b:failed']);
+  });
+
+  it('ignores an outcome callback that throws', async () => {
+    const { l, records } = logger();
+    const send = vi.fn().mockResolvedValue({ id: null });
+    const mailer = new BackgroundMailer({ send }, l);
+    mailer.enqueue('a', message, () => {
+      throw new Error('bookkeeping failed');
+    });
+    mailer.enqueue('b', message);
+    await mailer.drain(1000);
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(records.map((r) => r.record)).toEqual([
+      { event: 'email_sent', kind: 'a', attempts: 1 },
+      { event: 'email_sent', kind: 'b', attempts: 1 },
+    ]);
+  });
 });

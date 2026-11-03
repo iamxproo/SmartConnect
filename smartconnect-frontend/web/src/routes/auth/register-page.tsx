@@ -50,7 +50,7 @@ export function RegisterPage() {
   return (
     <AuthCard
       title="Create an account"
-      description="Joining a company still needs an invitation from its administrators."
+      description="Then create your company's organization, or join one through the invitation you received."
     >
       <form {...formProps} className="flex flex-col gap-4">
         <FormError message={formError} />

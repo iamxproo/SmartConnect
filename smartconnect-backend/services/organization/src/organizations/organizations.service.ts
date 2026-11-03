@@ -5,11 +5,19 @@ import { IdentityClient } from '../access/identity.client.js';
 import { isOwner, notFound, type Membership } from '../access/org-member.guard.js';
 import { hasPermission, OWNER_ROLE_KEY, SYSTEM_ROLES } from '../access/permissions.js';
 import { ORGANIZATION_CONFIG, type OrganizationConfig } from '../config.js';
-import { type Prisma, withTenant, withUser } from '../database/client.js';
+import { type Prisma, withTenant, withUser, withUserThenNewTenant } from '../database/client.js';
 import { PRISMA, type OrganizationPrisma } from '../database/prisma.token.js';
 import { conflict, forbidden, invalidField, isUniqueViolation } from '../errors.js';
 import { recordEvents } from '../events/outbox.js';
 import { decodeCursor, encodeCursor, uuidv7 } from '../ids.js';
+import {
+  baseRefusal,
+  creationRefusal,
+  isCapped,
+  ownedOrganizations,
+  refusalProblem,
+  type CreationEligibility,
+} from './creation-policy.js';
 import type { CreateOrganizationDto, ListMembersQueryDto, UpdateMemberDto, UpdateOrganizationDto } from './dto.js';
 
 export interface OrganizationSettings {
@@ -103,65 +111,109 @@ export class OrganizationsService {
     return { data: rows.map((row) => ({ ...row.organization, role: row.role })), nextCursor: null };
   }
 
+  /** Whether the caller may create an organization now, and if not, why (the onboarding screens ask first). */
+  async creationEligibility(req: Request, principal: Principal): Promise<CreationEligibility> {
+    const account = await this.identity.me(req);
+    const reason = await creationRefusal(this.config, account, () =>
+      withUser(this.prisma, principal.userId, (tx) => ownedOrganizations(tx, principal.userId)),
+    );
+    return { allowed: reason === undefined, reason: reason ?? null };
+  }
+
   /**
-   * Companies are created by authorized administrators only: the caller's VERIFIED email must be on the configured
-   * allowlist. The creator becomes the first owner; system roles are created with the organization.
+   * Creates an organization for an eligible caller (creation-policy.ts, ADR 0017). The creator becomes its first
+   * owner, and the system roles are created with it, in one transaction. One person's creations are serialized (an
+   * advisory lock), so the ownership cap holds under concurrency, and a repeated request (a retry after a lost
+   * response, a double submit) gets back the organization it created, instead of a second one or a conflict: same
+   * handle, same name, created and still owned by the caller. `created` says which.
    */
   async create(req: Request, principal: Principal, input: CreateOrganizationDto) {
     const account = await this.identity.me(req);
-    if (!account.emailVerified || !this.config.organizationCreatorEmails.has(account.email.toLowerCase())) {
-      throw forbidden('Your account is not authorized to create organizations.', 'organization_creation_not_allowed');
-    }
+    const refusal = baseRefusal(this.config, account);
+    if (refusal) throw refusalProblem(refusal, this.config);
+    const { userId } = principal;
     const organizationId = uuidv7();
     try {
-      return await withTenant(this.prisma, { organizationId, userId: principal.userId }, async (tx) => {
-        const org = await tx.organization.create({
-          data: {
-            id: organizationId,
-            slug: input.slug,
-            name: input.name,
-            description: input.description ?? null,
-            settings: { ...DEFAULT_SETTINGS },
-            createdByUserId: principal.userId,
-          },
-          select: organizationSelect,
-        });
-        let ownerRoleId = '';
-        for (const role of SYSTEM_ROLES) {
-          const created = await tx.organizationRole.create({
-            data: { organizationId, ...role, isSystem: true },
+      return await withUserThenNewTenant(
+        this.prisma,
+        { userId, organizationId },
+        // With the caller's own organizations in view (user-scoped policies only), under a lock per caller.
+        async (tx) => {
+          await tx.$queryRaw`SELECT 1 AS locked FROM (SELECT pg_advisory_xact_lock(hashtextextended(${`organization-create:${userId}`}, 0))) l`;
+          const earlier = await tx.organizationMember.findFirst({
+            where: {
+              userId,
+              status: 'active',
+              role: { key: OWNER_ROLE_KEY },
+              organization: {
+                slug: input.slug,
+                name: input.name,
+                createdByUserId: userId,
+                status: 'active',
+                deletedAt: null,
+              },
+            },
+            select: { organization: { select: organizationSelect } },
+          });
+          if (earlier) return { earlier: toOrganization(earlier.organization) };
+          if (
+            isCapped(this.config, account) &&
+            (await ownedOrganizations(tx, userId)) >= this.config.maxOwnedOrganizations
+          )
+            throw refusalProblem('limit_reached', this.config);
+          return { earlier: undefined };
+        },
+        // In the new organization's tenant context.
+        async (tx, { earlier }) => {
+          if (earlier) return { organization: earlier, created: false };
+          const org = await tx.organization.create({
+            data: {
+              id: organizationId,
+              slug: input.slug,
+              name: input.name,
+              description: input.description ?? null,
+              settings: { ...DEFAULT_SETTINGS },
+              createdByUserId: userId,
+            },
+            select: organizationSelect,
+          });
+          let ownerRoleId = '';
+          for (const role of SYSTEM_ROLES) {
+            const created = await tx.organizationRole.create({
+              data: { organizationId, ...role, isSystem: true },
+              select: { id: true },
+            });
+            if (role.key === OWNER_ROLE_KEY) ownerRoleId = created.id;
+          }
+          const member = await tx.organizationMember.create({
+            data: {
+              organizationId,
+              userId,
+              roleId: ownerRoleId,
+              displayName: account.displayName,
+              email: account.email,
+            },
             select: { id: true },
           });
-          if (role.key === OWNER_ROLE_KEY) ownerRoleId = created.id;
-        }
-        const member = await tx.organizationMember.create({
-          data: {
-            organizationId,
-            userId: principal.userId,
-            roleId: ownerRoleId,
-            displayName: account.displayName,
-            email: account.email,
-          },
-          select: { id: true },
-        });
-        await recordEvents(tx, [
-          {
-            eventType: 'organization.created',
-            aggregateType: 'organization',
-            aggregateId: organizationId,
-            organizationId,
-            payload: { organizationId, createdByUserId: principal.userId },
-          },
-          {
-            eventType: 'organization.member.joined',
-            aggregateType: 'member',
-            aggregateId: member.id,
-            organizationId,
-            payload: { organizationId, userId: principal.userId, roleKey: OWNER_ROLE_KEY },
-          },
-        ]);
-        return toOrganization(org);
-      });
+          await recordEvents(tx, [
+            {
+              eventType: 'organization.created',
+              aggregateType: 'organization',
+              aggregateId: organizationId,
+              organizationId,
+              payload: { organizationId, createdByUserId: userId },
+            },
+            {
+              eventType: 'organization.member.joined',
+              aggregateType: 'member',
+              aggregateId: member.id,
+              organizationId,
+              payload: { organizationId, userId, roleKey: OWNER_ROLE_KEY },
+            },
+          ]);
+          return { organization: toOrganization(org), created: true };
+        },
+      );
     } catch (error) {
       if (isUniqueViolation(error)) throw conflict('slug_taken', 'This organization handle is already in use.');
       throw error;

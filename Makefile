@@ -14,6 +14,7 @@ WITH_PRIVATE_JWK := if [ -z "$$AUTH_JWT_PRIVATE_JWK" ]; then export AUTH_JWT_PRI
 .PHONY: help install format format-check lint typecheck test-unit test-frontend web-dev gateway-dev gateway-start \
         gateway-test identity-start identity-test organization-start organization-test workspace-start workspace-test \
         messaging-start messaging-test files-start files-test realtime-start realtime-test \
+        backend-start backend-test e2e-unified load-30 \
         backend-kit-test auth-dev-keys build audit ci-local \
         infra-up infra-stop infra-ps test-db-up test-db-reset test-db-stop \
         prisma-validate prisma-generate db-bootstrap db-rotate db-migrate db-status \
@@ -100,6 +101,13 @@ realtime-start: ## Build and start the realtime gateway (ws://127.0.0.1:3105/rea
 	npm run build --workspace @smartconnect/realtime-gateway
 	@$(WITH_PUBLIC_JWKS) npm run start --workspace @smartconnect/realtime-gateway
 
+backend-start: ## Build and start the UNIFIED backend: all seven apps in one process, public http://127.0.0.1:3000 (REST + /realtime/socket.io), internal apps on 127.0.0.1:3101-3106. Not together with the *-start targets above (same ports). Needs db-migrate, auth-dev-keys, infra-up
+	npm run build --workspace @smartconnect/backend
+	@$(WITH_PUBLIC_JWKS) $(WITH_PRIVATE_JWK) npm run start --workspace @smartconnect/backend
+
+backend-test: ## Unified backend tests (environment views, ports, start/shutdown order, Socket.IO hand-off; no database)
+	npm run test --workspace @smartconnect/backend
+
 backend-kit-test: ## Shared backend kit tests (config helpers, access-token verification)
 	npm run test --workspace @smartconnect/backend-kit
 
@@ -112,7 +120,7 @@ build: ## Build every workspace that defines a build script (run prisma-generate
 audit: ## Fail on high/critical advisories in the dependency tree
 	npm audit --audit-level=high
 
-ci-local: format-check lint prisma-validate prisma-generate typecheck test-unit backend-kit-test gateway-test identity-test organization-test workspace-test messaging-test files-test realtime-test test-frontend build audit ## Run the CI quality gates locally (database + identity integration suites: make db-test)
+ci-local: format-check lint prisma-validate prisma-generate typecheck test-unit backend-kit-test gateway-test identity-test organization-test workspace-test messaging-test files-test realtime-test backend-test test-frontend build audit ## Run the CI quality gates locally (database + identity integration suites: make db-test)
 
 # --- Infrastructure -----------------------------------------------------------------------------
 infra-up: ## Start dev PostgreSQL + Redis and wait until healthy
@@ -177,6 +185,12 @@ db-test: test-db-reset ## Database suites + identity/auth integration (needs inf
 
 e2e: build test-db-up ## Browser tests (Playwright, local Chrome) against the whole stack on ports 3300-3305, 3309 + 5174 and the test DB
 	cd tests && npx playwright test --config e2e/playwright.config.ts $(ARGS)
+
+e2e-unified: build test-db-up ## The same browser tests against the UNIFIED backend (one process: public 3300, internal 3301-3305, 3309) + 5174 and the test DB
+	cd tests && E2E_BACKEND=unified npx playwright test --config e2e/playwright.config.ts $(ARGS)
+
+load-30: build test-db-up ## 30 simultaneous users (5 orgs x 6: Chrome owners + API/Socket.IO members) on the unified backend + test DB; results in the log dir
+	cd tests && E2E_BACKEND=unified npx playwright test --config load/playwright.config.ts $(ARGS)
 
 organization-creators: ## Store who may create organizations (ORGANIZATION_CREATOR_EMAILS) in .secrets/organization.env; run it in your terminal
 	@bash infrastructure/scripts/organization-creators.sh

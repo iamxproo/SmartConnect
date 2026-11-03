@@ -25,7 +25,9 @@ import {
 } from './invitations/invitations.controller.js';
 import { InvitationsService } from './invitations/invitations.service.js';
 import {
+  INVITATION_DELIVERIES,
   INVITATION_NOTIFIER,
+  InvitationDeliveries,
   InvitationDevMailbox,
   type InvitationNotifier,
 } from './notifications/invitation-notifier.js';
@@ -86,6 +88,7 @@ export class AppModule {
         { provide: ORGANIZATION_CONFIG, useValue: config },
         { provide: PRISMA, useValue: prisma },
         { provide: INVITATION_NOTIFIER, useValue: deps.notifier },
+        { provide: INVITATION_DELIVERIES, useValue: new InvitationDeliveries() },
         { provide: DEV_MAILBOX, useValue: deps.notifier },
         {
           provide: ACCESS_TOKEN_VERIFIER,

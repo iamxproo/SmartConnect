@@ -27,7 +27,9 @@ curl 'http://127.0.0.1:3102/dev/mailbox?to=invitee@example.com'          # invit
 |---|---|---|
 | `DATABASE_URL` / `_FILE` | **required** | Runtime role `sc_organization_app` (`services/organization/.env`, written by `make db-bootstrap`) |
 | `AUTH_JWT_PUBLIC_JWKS` / `_FILE` | **required** | The identity service's public keys |
-| `ORGANIZATION_CREATOR_EMAILS` | empty (nobody) | **Verified** emails allowed to create organizations. Kept in the gitignored `.secrets/organization.env` (written by `make organization-creators`, loaded by the `start` script after `.secrets/smtp.env`; `make db-bootstrap` never touches it). A value set in the environment takes precedence. The startup log reports only how many there are |
+| `ORGANIZATION_CREATION` | `allowlist` outside production | Who may create organizations (ADR 0017): `open` (any active account with a verified email: self-service) or `allowlist`. **Required in production**. Platform Super Admins never create organizations |
+| `ORGANIZATION_CREATOR_EMAILS` | empty (nobody) | **Verified** emails allowed to create organizations: the only creators with `ORGANIZATION_CREATION=allowlist`, and exempt from the cap with `open`. Kept in the gitignored `.secrets/organization.env` (written by `make organization-creators`, loaded by the `start` script after `.secrets/smtp.env`; `make db-bootstrap` never touches it). A value set in the environment takes precedence. The startup log reports only how many there are |
+| `ORGANIZATION_MAX_OWNED_PER_USER` | `10` | With `open`: organizations one person may own (1-1000); the next is refused with `organization_limit_reached` |
 | `IDENTITY_SERVICE_URL` | `http://127.0.0.1:3101` outside production | Used to read the caller's own account (email, verified) |
 | `WEB_APP_URL` | `http://127.0.0.1:5173` outside production | Invitation links. **Required in production, and https there** |
 | `INVITATION_NOTIFIER` | `dev-mailbox` outside production | `dev-mailbox`, `smtp` or `disabled`. **Required in production**, where `dev-mailbox` is refused |
@@ -35,7 +37,7 @@ curl 'http://127.0.0.1:3102/dev/mailbox?to=invitee@example.com'          # invit
 | `SMTP_PORT` / `SMTP_SECURE` | `587` / `false` | `false` = STARTTLS, always required; `true` = TLS from the start (465) |
 | `SMTP_REPLY_TO`, `SMTP_TIMEOUT_MS` | none / `15000` | Reply-To address; connection and greeting timeout (1000–60000) |
 
-With `smtp`, `SmtpInvitationNotifier` renders the invitation (`src/notifications/invitation-templates.ts`) and queues it in the kit's `BackgroundMailer`: `send` returns at once, delivery is retried with backoff, logs carry the message kind and failure category only, and queued mail is sent (up to 5 s) on shutdown. Organization, role and inviter names are escaped and never become links. `npm start` also loads the gitignored repo-root `.secrets/smtp.env`.
+With `smtp`, `SmtpInvitationNotifier` renders the invitation (`src/notifications/invitation-templates.ts`) and queues it in the kit's `BackgroundMailer`: `send` returns at once, delivery is retried with backoff, logs carry the message kind and failure category only, and queued mail is sent (up to 5 s) on shutdown. Organization, role and inviter names are escaped and never become links. Each message's final outcome comes back from the mailer, so every invitation answer says where its latest email stands (`delivery`: `queued`, `sent`, `failed`, `disabled`, or `unknown` after a restart, ADR 0017); the state is in memory, per instance. `npm start` also loads the gitignored repo-root `.secrets/smtp.env`.
 | `HOST`, `PORT`, `TRUST_PROXY_HOPS`, `NODE_ENV`, `LOG_LEVEL`, `API_DOCS_ENABLED`, `ERROR_TYPE_BASE_URL` | `127.0.0.1`, `3102`, `1` | As in the other services |
 
 ## What it enforces (each covered by tests)
