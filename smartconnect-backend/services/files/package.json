@@ -9,7 +9,7 @@
     "prisma:generate": "prisma generate",
     "db:migrate:deploy": "prisma migrate deploy",
     "db:migrate:status": "prisma migrate status",
-    "prebuild": "npm run build --workspace @smartconnect/backend-kit",
+    "prebuild": "npm run prisma:generate && npm run build --workspace @smartconnect/backend-kit",
     "build": "tsc -p tsconfig.build.json",
     "start": "node --env-file-if-exists=.env dist/main.js",
     "pretypecheck": "npm run build --workspace @smartconnect/backend-kit",
