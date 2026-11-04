@@ -7,12 +7,18 @@
 //   node infrastructure/scripts/db.mjs new-migration --service=<svc> --name=<snake_case> [--empty]
 //   node infrastructure/scripts/db.mjs check-drift [--service=<svc>]
 //   node infrastructure/scripts/db.mjs rehearse
+//   node infrastructure/scripts/db.mjs managed-bootstrap --credentials-file=<absolute path> [--rotate]
+//   node infrastructure/scripts/db.mjs managed-migrate   --credentials-file=<absolute path> [--service=<svc>]
 //
 // bootstrap/migrate/status act on the DEV database. new-migration/check-drift/rehearse only ever use
 // the disposable TEST instance (shadow databases / full migration rehearsal); they never touch DEV.
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+// managed-* act on a MANAGED database (e.g. Render; docs/runbooks/managed-postgres-bootstrap.md): its
+// administrator's URL comes from MANAGED_DATABASE_URL or MANAGED_DATABASE_URL_FILE (never a repository file),
+// and the service credentials are written to --credentials-file, which must lie outside the repository.
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import {
+  REPO_ROOT,
   SERVICES,
   applyBootstrap,
   assertService,
@@ -20,6 +26,7 @@ import {
   generatePassword,
   isContainerRunning,
   loadTargets,
+  managedTarget,
   parseEnvFile,
   provisionTestInstance,
   roleNames,
@@ -74,6 +81,40 @@ function passwordFromUrl(url, expectedUser) {
   }
   return decodeURIComponent(parsed.password) || undefined;
 }
+
+/** The managed administrator, from MANAGED_DATABASE_URL or MANAGED_DATABASE_URL_FILE (never printed). */
+function managedFromEnv() {
+  const inline = process.env.MANAGED_DATABASE_URL;
+  const file = process.env.MANAGED_DATABASE_URL_FILE;
+  if (inline && file) fail('set either MANAGED_DATABASE_URL or MANAGED_DATABASE_URL_FILE, not both');
+  const url = inline ?? (file ? readFileSync(file, 'utf8').trim() : undefined);
+  if (!url) fail("MANAGED_DATABASE_URL (or MANAGED_DATABASE_URL_FILE) is required: the managed administrator's URL");
+  try {
+    return managedTarget(url);
+  } catch (error) {
+    return fail(error.message);
+  }
+}
+
+/** --credentials-file: absolute, and outside the repository (credentials never land in the working tree). */
+function managedCredentialsFile() {
+  const file = opts['credentials-file'];
+  if (typeof file !== 'string' || !path.isAbsolute(file))
+    fail('--credentials-file=<absolute path outside the repository> is required');
+  const dir = path.dirname(file);
+  if (!existsSync(dir)) fail(`--credentials-file: directory ${dir} does not exist`);
+  const resolved = path.join(realpathSync(dir), path.basename(file));
+  const relative = path.relative(realpathSync(REPO_ROOT), resolved);
+  if (!relative.startsWith('..') && !path.isAbsolute(relative))
+    fail('--credentials-file must lie outside the repository');
+  return resolved;
+}
+
+/** <SERVICE>_DATABASE_URL (runtime, the unified backend's names) and <SERVICE>_MIGRATION_DATABASE_URL (migrations only). */
+const managedKeys = (svc) => ({
+  app: `${svc.toUpperCase()}_DATABASE_URL`,
+  migrator: `${svc.toUpperCase()}_MIGRATION_DATABASE_URL`,
+});
 
 function migrationEnv(svc) {
   const url = parseEnvFile(path.join(serviceDir(svc), '.env.migration')).MIGRATION_DATABASE_URL;
@@ -195,6 +236,107 @@ const commands = {
       console.log(`${res.status === 0 ? '✔' : '✖'} ${svc.padEnd(15)} ${summary.join(' ') || '(see prisma output)'}`);
     }
     if (pending) process.exit(1);
+  },
+
+  /**
+   * Bootstraps a MANAGED database as its administrator (CREATEROLE, owner of the database, no superuser): the
+   * bootstrap's managed branch, then fresh credentials for the 28 service roles (SCRAM verifiers; plaintext never
+   * sent), written to --credentials-file (mode 600, outside the repository) and reused on re-runs unless --rotate.
+   * pg_stat_statements is tried separately and is optional. Prints no password, URL or credential.
+   */
+  'managed-bootstrap'() {
+    const target = managedFromEnv();
+    const file = managedCredentialsFile();
+    const [user, superuser, createrole, owner, version] = runSql(
+      target,
+      `select current_user, r.rolsuper, r.rolcreaterole, pg_get_userbyid(d.datdba), current_setting('server_version')
+         from pg_roles r, pg_database d where r.rolname = current_user and d.datname = current_database()`,
+    ).split('|');
+    console.log(
+      `• ${target.host}:${target.port}/${target.database} as ${user}: PostgreSQL ${version}, ` +
+        `${superuser === 't' ? 'SUPERUSER (the original bootstrap runs)' : 'not a superuser (managed bootstrap)'}, ` +
+        `CREATEROLE ${createrole === 't' ? 'yes' : 'no'}, database owner ${owner}`,
+    );
+    applyBootstrap(target);
+    console.log('✔ schemas, roles and privileges applied');
+
+    const existing = opts.rotate ? {} : parseEnvFile(file);
+    const credentials = {};
+    const lines = [
+      `# SmartConnect managed database credentials (db.mjs managed-bootstrap, ${new Date().toISOString()}).`,
+      "# SECRET. Keep it out of the repository; copy the values into the deployment's secret store.",
+      '# <SERVICE>_DATABASE_URL: runtime (least-privilege sc_<svc>_app). The unified backend reads IDENTITY_, ORGANIZATION_,',
+      '#   WORKSPACE_, MESSAGING_ and FILES_DATABASE_URL.',
+      '# <SERVICE>_MIGRATION_DATABASE_URL: schema owner sc_<svc>_migrator, for `db.mjs managed-migrate` ONLY. Never give',
+      '#   these to a running service.',
+    ];
+    for (const svc of SERVICES) {
+      const roles = roleNames(svc);
+      const keys = managedKeys(svc);
+      const appPassword = passwordFromUrl(existing[keys.app], roles.app) ?? generatePassword();
+      const migratorPassword = passwordFromUrl(existing[keys.migrator], roles.migrator) ?? generatePassword();
+      credentials[roles.app] = appPassword;
+      credentials[roles.migrator] = migratorPassword;
+      const common = {
+        host: target.host,
+        port: target.port,
+        database: target.database,
+        schema: svc,
+        sslmode: target.sslmode,
+      };
+      lines.push(`${keys.app}=${connectionUrl({ user: roles.app, password: appPassword, ...common })}`);
+      lines.push(`${keys.migrator}=${connectionUrl({ user: roles.migrator, password: migratorPassword, ...common })}`);
+    }
+    // Stage the file, change the database, publish the file: a role never holds a password no file records.
+    const staged = stageSecretFile(file, `${lines.join('\n')}\n`);
+    try {
+      setRolePasswords(target, credentials);
+    } catch (error) {
+      staged.discard();
+      throw error;
+    }
+    staged.commit();
+    console.log(
+      `✔ credentials for ${Object.keys(credentials).length} roles written to the credentials file (mode 600)`,
+    );
+
+    const failures = [];
+    for (const [role, password] of Object.entries(credentials)) {
+      try {
+        runSql(target, 'select 1', { user: role, password });
+      } catch {
+        failures.push(role);
+      }
+    }
+    if (failures.length) fail(`these roles cannot sign in with their new credentials: ${failures.join(', ')}`);
+    console.log('✔ every service role signs in over TCP');
+
+    try {
+      runSql(target, 'CREATE EXTENSION IF NOT EXISTS pg_stat_statements WITH SCHEMA public');
+      console.log('✔ pg_stat_statements installed (optional)');
+    } catch (error) {
+      const reason = /permission denied[^\n]*/i.exec(error.stderr ?? '')?.[0] ?? 'refused';
+      console.log(`• pg_stat_statements not installed (optional; ${reason}): ask the provider if it is wanted`);
+    }
+  },
+
+  /** Every service's migrations as its own migrator role, then the bootstrap again (privileges for new objects). */
+  'managed-migrate'() {
+    const target = managedFromEnv();
+    const credentials = parseEnvFile(managedCredentialsFile());
+    try {
+      for (const svc of selectedServices()) {
+        if (!hasMigrations(svc)) continue;
+        const url = credentials[managedKeys(svc).migrator];
+        if (!url) fail(`${svc}: no ${managedKeys(svc).migrator} in the credentials file — run managed-bootstrap first`);
+        passwordFromUrl(url, roleNames(svc).migrator); // the CLI runs as that service's migrator, nobody else
+        runPrisma(svc, ['migrate', 'deploy'], { env: { MIGRATION_DATABASE_URL: url }, capture: true });
+        console.log(`✔ ${svc.padEnd(15)} migrations applied as ${roleNames(svc).migrator}`);
+      }
+    } finally {
+      applyBootstrap(target); // re-assert privileges even if a migration failed part-way
+      console.log('✔ bootstrap re-applied');
+    }
   },
 
   'new-migration'() {

@@ -68,13 +68,46 @@ export function loadTargets() {
     },
     test: {
       name: 'test',
-      container: 'smartconnect-postgres-test',
+      container: env.POSTGRES_TEST_CONTAINER ?? 'smartconnect-postgres-test',
       adminUser: env.POSTGRES_TEST_USER ?? 'smartconnect_test_admin',
       adminPassword: env.POSTGRES_TEST_PASSWORD,
       database: env.POSTGRES_TEST_DB ?? 'smartconnect_test',
       host: env.POSTGRES_TEST_HOST ?? '127.0.0.1',
       port: Number(env.POSTGRES_TEST_PORT ?? 15433),
+      // The managed rehearsal (managed-rehearsal.mjs): the admin above is a managed database's administrator
+      // (it bootstraps and provisions), and this superuser only inspects the catalog and injects faults.
+      inspectUser: env.POSTGRES_TEST_INSPECT_USER,
+      inspectPassword: env.POSTGRES_TEST_INSPECT_PASSWORD,
     },
+  };
+}
+
+/**
+ * A managed database's administrator (e.g. Render: CREATEROLE and the database's ownership, no superuser), from a
+ * postgresql:// URL that comes from the environment, never from a repository file. Always reached over TCP; the
+ * URL's sslmode (e.g. require) is honoured. The password stays in memory and is handed to psql as PGPASSWORD.
+ */
+export function managedTarget(url) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error('the managed database URL is not a URL');
+  }
+  if (!/^postgres(ql)?:$/.test(parsed.protocol)) throw new Error('the managed database URL must be postgresql://');
+  const database = decodeURIComponent(parsed.pathname.replace(/^\//, ''));
+  if (!parsed.hostname || !parsed.username || !parsed.password || !database)
+    throw new Error('the managed database URL needs a host, a user, a password and a database');
+  return {
+    name: 'managed',
+    container: undefined,
+    transport: 'tcp',
+    host: parsed.hostname,
+    port: Number(parsed.port || 5432),
+    database,
+    adminUser: decodeURIComponent(parsed.username),
+    adminPassword: decodeURIComponent(parsed.password),
+    sslmode: parsed.searchParams.get('sslmode') ?? undefined,
   };
 }
 
@@ -89,12 +122,17 @@ export function runSql(
   { database = target.database, user = target.adminUser, password = target.adminPassword } = {},
 ) {
   const flags = ['-X', '-q', '-A', '-t', '-v', 'ON_ERROR_STOP=1', '-U', user, '-d', database];
-  const viaTcp = process.env.SC_PSQL === 'tcp' || user !== target.adminUser;
+  const viaTcp = target.transport === 'tcp' || process.env.SC_PSQL === 'tcp' || user !== target.adminUser;
   const res = viaTcp
     ? spawnSync('psql', ['-h', target.host, '-p', String(target.port), ...flags], {
         input: sql,
         encoding: 'utf8',
-        env: { ...process.env, PGPASSWORD: password, PGCONNECT_TIMEOUT: '5' },
+        env: {
+          ...process.env,
+          PGPASSWORD: password,
+          PGCONNECT_TIMEOUT: '5',
+          ...(target.sslmode && { PGSSLMODE: target.sslmode }),
+        },
       })
     : spawnSync('docker', ['exec', '-i', target.container, 'psql', ...flags], { input: sql, encoding: 'utf8' });
   if (res.error) throw res.error;
@@ -138,9 +176,10 @@ export function setRolePasswords(target, credentials) {
   runSql(target, ['BEGIN;', ...statements, 'COMMIT;'].join('\n'));
 }
 
-export function connectionUrl({ user, password, host, port, database, schema }) {
+export function connectionUrl({ user, password, host, port, database, schema, sslmode }) {
   const url = `postgresql://${encodeURIComponent(user)}:${encodeURIComponent(password)}@${host}:${port}/${encodeURIComponent(database)}`;
-  return schema ? `${url}?schema=${encodeURIComponent(schema)}` : url;
+  const query = new URLSearchParams({ ...(schema && { schema }), ...(sslmode && { sslmode }) }).toString();
+  return query ? `${url}?${query}` : url;
 }
 
 /**

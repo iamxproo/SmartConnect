@@ -5,4 +5,7 @@ Operational procedures. Existing procedures live with their subsystem for now:
 - Credential rotation: [../database/security.md#credential-rotation](../database/security.md#credential-rotation)
 - Failed migration recovery: [../database/migrations.md#failed-migration-recovery](../database/migrations.md#failed-migration-recovery)
 
-**Status:** planned — intentionally empty. This README keeps the directory in git (git does not track empty directories).
+Procedures in this directory:
+- Managed PostgreSQL bootstrap (Render; no superuser): [managed-postgres-bootstrap.md](managed-postgres-bootstrap.md)
+
+**Status:** partly populated; the procedures above still live with their subsystem.

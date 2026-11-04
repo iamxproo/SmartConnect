@@ -7,6 +7,8 @@ import { inject } from 'vitest';
 export interface ProvidedDb {
   services: Record<string, { appUrl: string; migratorUrl: string }>;
   admin: { host: string; port: number; database: string; user: string; password: string };
+  /** The role that ran the bootstrap and provisioned the roles (a superuser, or a managed administrator). */
+  bootstrapUser: string;
 }
 
 declare module 'vitest' {
@@ -18,6 +20,7 @@ declare module 'vitest' {
 const provided = () => inject('db');
 
 export const appUrl = (svc: string): string => provided().services[svc]!.appUrl;
+export const bootstrapUser = (): string => provided().bootstrapUser;
 export const migratorUrl = (svc: string): string => provided().services[svc]!.migratorUrl;
 
 export function adminUrl(database = provided().admin.database): string {

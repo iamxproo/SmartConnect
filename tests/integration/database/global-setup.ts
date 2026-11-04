@@ -16,14 +16,17 @@ export default function setup(project: TestProject): void {
 
   const db: ProvidedDb = {
     services,
-    // provisionTestInstance() has already failed if the test admin password is missing.
+    // provisionTestInstance() has already failed if the test admin password is missing. The suites inspect the
+    // catalog and inject faults as this admin, or as the inspection superuser when the admin is a managed database's
+    // administrator (the managed rehearsal: infrastructure/scripts/managed-rehearsal.mjs).
     admin: {
       host: target.host,
       port: target.port,
       database: target.database,
-      user: target.adminUser,
-      password: target.adminPassword!,
+      user: target.inspectUser ?? target.adminUser,
+      password: target.inspectPassword ?? target.adminPassword!,
     },
+    bootstrapUser: target.adminUser,
   };
   project.provide('db', db);
 }

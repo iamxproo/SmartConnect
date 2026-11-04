@@ -1,0 +1,48 @@
+# Disposable PostgreSQL 18 for rehearsing the MANAGED bootstrap (make db-rehearse-managed;
+# infrastructure/scripts/managed-rehearsal.mjs). Nothing here is a real provider, the dev database or the test
+# database. The rehearsal script starts it, creates a Render-like administrator (CREATEROLE, CREATEDB, no SUPERUSER,
+# REPLICATION or BYPASSRLS) owning a fresh database, runs everything as that administrator, and stops it again.
+#
+# Unlike the test instance it mounts NO init scripts: the bootstrap must run as the managed administrator, never
+# as this container's superuser. The superuser's password exists only in the rehearsal process and reaches the
+# container as a Compose secret (/run/secrets), never in `docker inspect`. Data lives in tmpfs.
+name: smartconnect-pg18-rehearsal
+
+services:
+  postgres-18:
+    image: postgres:18-alpine
+    container_name: smartconnect-postgres18-rehearsal
+    restart: 'no'
+    shm_size: 256mb
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: rehearsal_root
+      POSTGRES_PASSWORD_FILE: /run/secrets/rehearsal_root_password
+      POSTGRES_INITDB_ARGS: '--auth-host=scram-sha-256'
+    secrets:
+      - rehearsal_root_password
+    command:
+      - postgres
+      - -c
+      - max_connections=150
+      - -c
+      - password_encryption=scram-sha-256
+      - -c
+      - fsync=off
+      - -c
+      - timezone=UTC
+    tmpfs:
+      - /var/lib/postgresql:size=768m
+    ports:
+      - '127.0.0.1:15434:5432'
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -h 127.0.0.1 -p 5432 -U rehearsal_root -d postgres']
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+secrets:
+  rehearsal_root_password:
+    environment: REHEARSAL_ROOT_PASSWORD

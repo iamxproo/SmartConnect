@@ -1803,3 +1803,156 @@ All on 2026-11-04, on the final code, locally. The integration and browser suite
   - All earlier work is preserved.
 - **Processes:** everything started for verification has stopped; ports 3000, 3101–3106, 3300–3309, 3320–3326 and 5174 are free, and the project owner's Vite on 5173 was not touched.
 - **Workstream 2 is complete locally. Stopping for review;** the next workstream has not been started.
+
+## Addendum: Managed PostgreSQL bootstrap for Render, rehearsed on PostgreSQL 18 (2026-11-04)
+
+**Outcome:** the bootstrap now works on a managed PostgreSQL where the provider keeps the superuser. It needs a database administrator with `CREATEROLE` that owns the database, and no `SUPERUSER`, `REPLICATION` or `BYPASSRLS`. That is the profile stated for the Render target, PostgreSQL 18.6.
+
+The result is the same as on the local superuser path:
+- 14 schemas and 28 service roles;
+- the same grants, default privileges, RLS, function permissions and drift correction.
+
+**Rehearsal:** on a disposable PostgreSQL **18.6** container reproducing that profile:
+- runner, migrations and re-runs: all pass;
+- catalog checks: all pass;
+- application integration suites: 527/527;
+- database security suites: 359 of 374 pass. The **15 failures** are the provider-database residual (§5), kept as failures, not skipped.
+
+**PostgreSQL 16 superuser workflow:** unchanged and passing (§4).
+
+**Real Render database: not touched.** No connection, migration, credential or deployment.
+
+### 1. What changed
+
+| File | Change |
+|---|---|
+| `infrastructure/compose/postgres/init/010_bootstrap.sql` | It picks its branch by `rolsuper` of the current user. **Superuser: identical statements**; one step (4b, schema `USAGE`) moved after step 5 (database `CONNECT`); the two are independent. **Managed:** see §2 |
+| `infrastructure/scripts/lib/db-lib.mjs` | `managedTarget(url)` parses the administrator's `postgresql://` URL (always TCP; `sslmode` honoured). `runSql` passes `PGSSLMODE`. `connectionUrl` carries `sslmode`. The test target accepts `POSTGRES_TEST_CONTAINER`, `POSTGRES_TEST_INSPECT_USER` and `POSTGRES_TEST_INSPECT_PASSWORD` (rehearsal only) |
+| `infrastructure/scripts/db.mjs` | New commands `managed-bootstrap` and `managed-migrate` (§3). Local commands are unchanged |
+| `infrastructure/scripts/managed-rehearsal.mjs` (new), `infrastructure/compose/postgres18-rehearsal.yml` (new), `Makefile` | `make db-rehearse-managed`: the isolated PostgreSQL 18 rehearsal (§4) |
+| `tests/integration/database/global-setup.ts`, `tests/support/database.ts` | Catalog inspection and fault injection may use a separate superuser while the managed administrator provisions. Default behaviour is unchanged |
+| `tests/security/database/roles-and-privileges.test.ts` | **One test added, none changed or skipped.** "Whoever bootstrapped never inherits a service role: it may only SET ROLE to migrators". It holds in both modes |
+| `docs/runbooks/managed-postgres-bootstrap.md` (new), `docs/runbooks/README.md`, `docs/database/security.md` | Procedure, the differences from the superuser path, residual R13, checklist link |
+
+### 2. The managed branch, and how it keeps the security model
+
+1. **Checks before any change; any failure aborts the whole transaction.** The administrator must have `CREATEROLE` and must own `current_database()`.
+2. **No automatic SET or INHERIT for the creator.** `createrole_self_grant` is cleared for the transaction, whatever the provider or the role sets. The rehearsal sets it to `'set, inherit'` on the administrator to prove this.
+3. **Role attributes.**
+   - `LOGIN NOCREATEDB NOCREATEROLE NOINHERIT` and connection limits 5 (migrator) and 25 (runtime) are set as before.
+   - PostgreSQL 16+ lets only a role holding `SUPERUSER`, `REPLICATION` or `BYPASSRLS` name them, so they are **checked**: a service role holding one is refused.
+4. **Ownership without inheritance.**
+   - Each migrator is granted to the administrator `WITH INHERIT FALSE, SET TRUE`: it can *act as* the schema owner, but never holds the owner's privileges implicitly. An inheriting member would count as every table's owner and so bypass RLS.
+   - Nothing is granted on runtime roles.
+   - **New verify-and-abort:** an existing inheriting membership in either role, or `SET` on the runtime role, aborts the run with the membership named, whoever granted it.
+5. **Owner-level statements run as the owner.** `SET LOCAL ROLE sc_<svc>_migrator` … `RESET ROLE` wraps:
+   - schema `USAGE`;
+   - default privileges;
+   - drift correction on existing objects;
+   - the `_prisma_migrations` revoke;
+   - the append-only revoke on `administration.audit_logs`.
+
+   Creating or re-owning a schema needs `SET` on the migrator. A schema owned by anyone else fails loudly.
+6. **Provider restrictions.**
+   - `postgres` and `template1` are not changed (§5).
+   - `pg_stat_statements` is created only when a superuser runs the SQL. `managed-bootstrap` tries it separately and reports the result; on the rehearsal it was skipped with "permission denied".
+   - Everything SmartConnect owns is still hardened: PUBLIC is revoked on the database, `public` is closed, and so on.
+
+### 3. Runner: credentials never in the repository or the logs
+
+- **Administrator URL:** `MANAGED_DATABASE_URL` or `MANAGED_DATABASE_URL_FILE` (not both), from the operator's environment. The repository's `.env` is never read for it, and it is never printed.
+- **`managed-bootstrap --credentials-file=<absolute path>`:**
+  - The path is refused if it is inside the repository (realpath check).
+  - It writes 28 URLs at mode 600, staged first, then the passwords set as SCRAM verifiers, then published.
+  - Passwords are reused on re-runs; `--rotate` replaces them.
+  - It checks that every role signs in, then tries `pg_stat_statements`.
+  - Output: a profile line (user, version, superuser, `CREATEROLE`, database owner) and ticks; no secrets.
+- **`managed-migrate`:**
+  - `prisma migrate deploy` per service, using only that service's `<SVC>_MIGRATION_DATABASE_URL`. That URL is checked to name `sc_<svc>_migrator`.
+  - Then the bootstrap again, also after a failure.
+- **Local workflow unchanged:** `db-bootstrap`, `db-migrate`, `db-rotate`, `db-rehearse` and `db-test`.
+- **Leak check:** every rehearsal log was searched for `scheme://user:password@`. 0 hits.
+
+### 4. Validation
+
+**Isolated PostgreSQL 18 (`make db-rehearse-managed`)**
+
+Setup:
+- `postgres:18-alpine` (server 18.6), project `smartconnect-pg18-rehearsal`, `127.0.0.1:15434`, tmpfs, no init scripts.
+- A random superuser password held only by the process and passed as a Compose secret.
+- As that superuser: `CREATE ROLE render_admin LOGIN CREATEROLE CREATEDB NOSUPERUSER NOREPLICATION NOBYPASSRLS` and `CREATE DATABASE … OWNER render_admin`.
+- Profile printed and asserted: `SUPERUSER=f CREATEROLE=t CREATEDB=t BYPASSRLS=f REPLICATION=f`, `pg_stat_statements` available but not installed.
+
+| Phase | Result |
+|---|---|
+| `managed-bootstrap` as `render_admin` (createrole_self_grant `'set, inherit'`) | ✔ |
+| `managed-migrate`: 14 services, each as its own migrator, then the bootstrap again | ✔ 24 migrations |
+| `managed-bootstrap` again (idempotent, credentials reused) | ✔ |
+| Schemas | ✔ 14/14, each owned by `sc_<svc>_migrator` |
+| Roles (`pg_authid`) | ✔ 28/28: no SUPERUSER, CREATEDB, CREATEROLE, REPLICATION or BYPASSRLS; NOINHERIT; LOGIN; limits 5/25; SCRAM-SHA-256 |
+| Administrator memberships | ✔ ADMIN on 28; SET on the 14 migrators only; INHERIT on none |
+| Service-role memberships | ✔ none |
+| Runtime grants | ✔ 103 tables: exactly SELECT/INSERT/UPDATE/DELETE; `audit_logs` INSERT/SELECT; `_prisma_migrations` nothing |
+| Cross-service grants | ✔ none |
+| Default privileges | ✔ per migrator: tables `arwd`, sequences `rU`, functions `X` to its runtime role; functions not to PUBLIC |
+| Row-level security | ✔ 54 tenant tables, each with RLS and a policy |
+| Function permissions | ✔ nothing executable by PUBLIC; 5 SECURITY DEFINER functions, own service only |
+| Database hardening | ✔ PUBLIC holds nothing on the database, `public` or any service schema |
+| `pg_stat_statements` | skipped: permission denied, as designed |
+| Fault injection: administrator INHERITs a migrator | ✔ refused, nothing committed |
+| Fault injection: administrator may SET ROLE to a runtime role | ✔ refused, nothing committed |
+| Fault injection: a service role has BYPASSRLS | ✔ refused, nothing committed |
+| Fault injection: a service role has REPLICATION | ✔ refused, nothing committed |
+| Fault injection: administrator does not own the database | ✔ refused, nothing committed |
+| Fault injection: administrator lacks CREATEROLE | ✔ refused, nothing committed |
+| Bootstrap after the faults are reverted | ✔ runs, and strips the grant planted before the faults |
+
+How the fault injection was run:
+- Before each fault, a cross-service grant was planted. It was still present after each refusal, which proves the transaction rolled back; that matters most for the faults found part-way through the service loop.
+- Each refusal names its check, for example `render_admin inherits sc_identity_migrator … revoke that membership first`.
+
+**Suites on a fresh 18.6 container** (`render_admin` is the test admin; the suites' global setup bootstraps, migrates and re-bootstraps as it; the superuser only inspects and injects faults):
+
+| Suites | Result |
+|---|---|
+| `security/database/**` + `integration/database/migrations.test.ts` | **359 passed, 15 failed** (374). All 15 are §5. They include tenant isolation, role and privilege, drift correction (stray grants planted by a superuser, stripped by the managed bootstrap), migrations recorded, `migrate deploy` no-op, `migrate status` up to date, runtime credentials cannot migrate, and the new membership test |
+| All other `integration/**` (identity, organization, workspace, messaging, files including R2, gateway, realtime, platform) | **527/527 passed** (41 files) |
+| Not run on 18 | `integration/database/infrastructure.test.ts` and `backup-restore.test.ts`: they test the local PostgreSQL 16 Docker instance and its backup scripts (`docker exec`, superuser `pg_dump`/restore), not the bootstrap. They are not part of a Render deployment |
+
+**PostgreSQL 16 superuser workflow (`make db-test`, unchanged local path):** **921/921**, including the new membership test and all 15 maintenance-database and `template1` assertions.
+
+- **First run:** 919 passed, 2 failed in `integration/platform/unified-backend.test.ts`. Registration through the gateway got `429`, and the Socket.IO check failed as a consequence.
+- **Cause: not the database.**
+  - The gateway allows 10 registrations per hour per IP (`rl:register-ip`, a token bucket in the shared local Redis).
+  - The back-to-back PostgreSQL 18 runs had used it up; read-only inspection showed 0.51 tokens left.
+- **Re-run of that file** after the bucket refilled to 3 tokens (no key was cleared): **8/8 passed**.
+- **Note:** running `make db-rehearse-managed` and `make db-test` back to back within an hour can hit this limit again. That is a test-environment interaction, not a regression.
+
+**Static checks:** `make format-check`, `make lint` and `make typecheck` pass. `node --check` passes on the changed scripts.
+
+### 5. Remaining blockers and residuals
+
+1. **R13. Provider databases (open; the provider's call or an explicit acceptance).**
+   - What stays open: PUBLIC keeps `CONNECT` on `postgres` and `template1`, which a non-owner administrator cannot revoke. So a service role can open a session there.
+   - What that exposes: no SmartConnect data, only the cluster catalog it already sees, under its connection limit.
+   - How it shows: 15 security tests fail (14 × "runtime role cannot connect to the maintenance database", 1 × "PUBLIC cannot connect to template1"). On Render this depends on how its `postgres` database is set up, which was not observed.
+   - To close it: ask Render to revoke PUBLIC `CONNECT` on those databases, or record an acceptance.
+   - **Not done:** tests were not changed or skipped to hide it.
+2. **Unverified against the real Render database.** The profile (CREATEROLE, CREATEDB, database owner, no superuser) is the one stated for the target; the first `managed-bootstrap` prints and checks it. Also unexercised:
+   - TLS: the rehearsal used `sslmode=disable` locally; Render's external URL needs `sslmode=require`;
+   - the provider's `createrole_self_grant`, `max_connections` and any event triggers.
+3. **`pg_stat_statements`** needs the provider; it is optional and not a security control.
+4. **One environment per PostgreSQL instance.** The 28 role names are cluster-wide.
+5. **The administrator's URL is the root credential.** It keeps ADMIN on all service roles and SET on the migrators. It must stay out of the web service and live only in the secret store and on the operator's machine.
+6. **Connection budget.** Role limits total 420 (14×5 + 14×25); the unified backend uses 5 runtime roles. Check pool sizes against the Render plan's `max_connections` before go-live (not measured here).
+
+### 6. Confirmation
+
+- **Real Render database:** not connected to or modified. No live migration, no deployment.
+- **Credentials:** no production credential was read or modified, and no `.env` or secret file was modified. Rehearsal passwords were random, in memory, and gone with the containers. The rehearsal's credentials file lived in a private temporary directory that was removed. The local Redis password was read from `.env` only to inspect the rate-limit bucket; it was passed on stdin and never printed.
+- **Containers:** `smartconnect-postgres18-rehearsal` was removed after every run; the dev database (15432), the user's gateway (:3000) and Vite (5173) were not touched. The test instance (15433) was reset only by `make db-test`.
+- **Security assertions:** none weakened or skipped. One assertion was added.
+- **Version control:** no commit, push or destructive Git operation.
+  - HEAD is `bd2cc1e`, the project owner's own commit made during this session (earlier workstreams).
+  - Working tree: 10 modified (including this report) and 3 untracked files, all from this task (§1). Nothing staged, no stash.
+- **Stopped after the isolated PostgreSQL 18 validation,** as instructed.

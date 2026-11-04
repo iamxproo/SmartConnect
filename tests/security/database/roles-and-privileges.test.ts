@@ -2,7 +2,16 @@
 // Runs on the disposable test instance. Every probe runs inside a rolled-back transaction.
 import { describe, expect, it } from 'vitest';
 import { SERVICES, applyBootstrap, loadTargets } from '../../../infrastructure/scripts/lib/db-lib.mjs';
-import { adminUrl, appUrl, migratorUrl, query, sqlError, withDatabase, withPassword } from '../../support/database.js';
+import {
+  adminUrl,
+  appUrl,
+  bootstrapUser,
+  migratorUrl,
+  query,
+  sqlError,
+  withDatabase,
+  withPassword,
+} from '../../support/database.js';
 
 const other = (svc: string): string => SERVICES[(SERVICES.indexOf(svc) + 1) % SERVICES.length]!;
 
@@ -37,6 +46,24 @@ describe('role attributes', () => {
       `select m.rolname from pg_auth_members am join pg_roles m on m.oid = am.member where m.rolname like 'sc\\_%'`,
     );
     expect(rows).toEqual([]);
+  });
+
+  it('whoever bootstrapped never inherits a service role: it may only SET ROLE to migrators (managed databases)', async () => {
+    // A superuser bootstrap holds no membership at all; a managed administrator administers every service role
+    // and may act as a migrator to grant on its objects, but inherits nothing (owners bypass row-level security).
+    const rows = await query<{ role: string; inherits: boolean; sets: boolean }>(
+      adminUrl(),
+      `
+      select r.rolname as role, bool_or(am.inherit_option) as inherits, bool_or(am.set_option) as sets
+      from pg_auth_members am join pg_roles r on r.oid = am.roleid join pg_roles m on m.oid = am.member
+      where m.rolname = $1 and r.rolname like 'sc\\_%'
+      group by r.rolname`,
+      [bootstrapUser()],
+    );
+    for (const r of rows) {
+      expect(r.inherits, r.role).toBe(false);
+      expect(r.sets, r.role).toBe(r.role.endsWith('_migrator'));
+    }
   });
 
   it('only superusers can bypass row-level security', async () => {

@@ -18,7 +18,7 @@ WITH_PRIVATE_JWK := if [ -z "$$AUTH_JWT_PRIVATE_JWK" ]; then export AUTH_JWT_PRI
         backend-kit-test auth-dev-keys build audit ci-local \
         infra-up infra-stop infra-ps test-db-up test-db-reset test-db-stop \
         prisma-validate prisma-generate db-bootstrap db-rotate db-migrate db-status \
-        db-migration db-drift db-rehearse db-seed admin-seed db-test db-backup db-docs e2e \
+        db-migration db-drift db-rehearse db-rehearse-managed db-seed admin-seed db-test db-backup db-docs e2e \
         smtp-credentials smtp-check smtp-test-email organization-creators
 
 help: ## Show available targets
@@ -170,6 +170,9 @@ db-drift: ## Fail if any schema.prisma differs from its migrations (uses the tes
 
 db-rehearse: ## Rehearse bootstrap + all migrations on the test instance
 	$(DB) rehearse
+
+db-rehearse-managed: ## Rehearse the MANAGED (Render-like, no superuser) bootstrap on a disposable PostgreSQL 18 (127.0.0.1:15434; needs infra-up for Redis)
+	node infrastructure/scripts/managed-rehearsal.mjs $(ARGS)
 
 db-seed: ## Load idempotent demo data into the dev database (through each service's runtime role)
 	npm run db:seed --workspace @smartconnect/backend-scripts

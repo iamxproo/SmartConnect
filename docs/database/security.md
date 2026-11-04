@@ -4,7 +4,7 @@ Least privilege, enforced by PostgreSQL and verified by the automated suite (`te
 
 ## Principles
 
-1. **Services never use the admin account.** `smartconnect_admin` (superuser) is used only to apply the bootstrap.
+1. **Services never use the admin account.** `smartconnect_admin` (superuser) is used only to apply the bootstrap. On a managed database without a superuser (Render), the provider's administrator (CREATEROLE, owner of the database) applies it instead, with the same result; see [../runbooks/managed-postgres-bootstrap.md](../runbooks/managed-postgres-bootstrap.md).
 2. **Runtime and migration credentials are separate roles and separate files.**
 3. **Runtime roles own nothing and create nothing.** They get USAGE on one schema and DML on its tables, nothing more.
 4. **Every privilege is granted explicitly, and the bootstrap re-asserts the model on every run**: role attributes, memberships, database and schema ACLs, and the grants on every *existing* table, sequence and routine (any other grantee is stripped). Manual drift is reverted, and this is tested by injecting stray grants. `make db-migrate` re-runs it even when a migration fails.
@@ -153,11 +153,12 @@ Password authentication (`requirepass`, injected from a Docker secret by `entryp
 | R10 | Tenant GUCs are forgeable through SQL injection; audit `event_id` / platform rows insertable by a compromised runtime role | Inherent | Documented: RLS defends against application bugs, not a compromised role or SQL injection. Parameterised queries are mandatory |
 | R11 | Global unique keys (`conversations.channel_id`, `meetings.media_room_id`, `file_versions.storage_key`) can reveal existence via unique-violation errors | Low | Accepted: needs guessing 74 random bits of a UUIDv7 / server-generated key |
 | R12 | `webhooks_https_chk` allows internal hosts; local backups unencrypted and checksums are not signatures | Low | Documented: SSRF egress filtering in the delivery worker; production backups encrypted + access-controlled ([backup-and-restore.md](backup-and-restore.md)) |
+| R13 | Managed databases: PUBLIC keeps `CONNECT` on the provider's `postgres` and `template1`, which a non-owner administrator cannot revoke | Low | **Open, provider-dependent**: no SmartConnect data there, and the 15 tests that check it fail rather than being skipped. Ask the provider, or accept it ([runbook](../runbooks/managed-postgres-bootstrap.md#residual-provider-databases)) |
 
 ## Production hardening checklist
 
 - [ ] Managed PostgreSQL 16, private networking, TLS enforced (`hostssl`, `verify-full`), encryption at rest
-- [ ] Bootstrap SQL applied by the pipeline's admin role. Admin credentials are never given to services
+- [ ] Bootstrap SQL applied by the pipeline's admin role (managed: [runbook](../runbooks/managed-postgres-bootstrap.md)). Admin credentials are never given to services
 - [ ] One secret per role in the secrets manager; migrator secrets only in migration jobs
 - [ ] PgBouncer (transaction mode) between services and PostgreSQL
 - [ ] `log_connections`, `log_disconnections` and pgAudit (DDL + role changes) enabled; logs shipped to the SIEM
